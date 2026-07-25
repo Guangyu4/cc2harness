@@ -79,12 +79,20 @@ def tmux_run(*args, timeout=5):
 
 
 def list_tmux_sessions():
+    """返回 [{"name": tmux 会话名, "label": 用户自定义名称}]。
+    自定义名称存在 tmux 会话的 @label 用户选项里，随会话存亡。"""
     if not TMUX:
         return []
-    code, out = tmux_run("list-sessions", "-F", "#{session_name}")
+    code, out = tmux_run("list-sessions", "-F", "#{session_name}\t#{@label}")
     if code != 0:  # tmux server 未运行 => 无会话
         return []
-    return sorted(n for n in out.splitlines() if NAME_RE.match(n))
+    result = []
+    for line in out.splitlines():
+        name, _, label = line.partition("\t")
+        if NAME_RE.match(name):
+            result.append({"name": name, "label": label.strip()})
+    result.sort(key=lambda s: s["name"])
+    return result
 
 
 def kill_session(name):
@@ -327,6 +335,25 @@ class KillHandler(tornado.web.RequestHandler):
         self.write({"ok": ok})
 
 
+class RenameHandler(tornado.web.RequestHandler):
+    def post(self):
+        name = self.get_argument("name", "")
+        label = self.get_argument("label", "")
+        if not NAME_RE.match(name):
+            self.set_status(400)
+            self.write({"error": "非法的会话名"})
+            return
+        label = "".join(c for c in label if c.isprintable()).strip()[:32]
+        if not TMUX:
+            self.write({"ok": False})
+            return
+        if label:
+            code, _ = tmux_run("set-option", "-t", name, "@label", label)
+        else:  # 空名称 = 恢复默认编号
+            code, _ = tmux_run("set-option", "-u", "-t", name, "@label")
+        self.write({"ok": code == 0})
+
+
 class FsHandler(tornado.web.RequestHandler):
     async def get(self, action):
         path = self.get_argument("path", "")
@@ -380,6 +407,7 @@ def make_app():
         (r"/ws", TermHandler),
         (r"/api/sessions", SessionsHandler),
         (r"/api/kill", KillHandler),
+        (r"/api/rename", RenameHandler),
         (r"/api/fs/(list|view|download)", FsHandler),
         (r"/(.*)", tornado.web.StaticFileHandler,
          {"path": STATIC_DIR, "default_filename": "index.html"}),

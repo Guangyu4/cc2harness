@@ -84,9 +84,31 @@ function tabLabel(name) {
   return m ? `终端 ${m[1]}` : name;
 }
 
+function sessLabel(s) {
+  return s.label || tabLabel(s.name);
+}
+
+async function renameSession(s) {
+  const val = prompt("终端名称（留空恢复默认编号）：", sessLabel(s));
+  if (val === null) return;
+  const label = val.trim().slice(0, 32);
+  try {
+    const r = await fetch(
+      `/api/rename?name=${encodeURIComponent(s.name)}&label=${encodeURIComponent(label)}`,
+      { method: "POST" });
+    if (!(await r.json()).ok) throw new Error();
+    s.label = label || null;
+    s.tab.querySelector(".label").textContent = sessLabel(s);
+    toast("已重命名");
+  } catch {
+    toast("重命名失败", true);
+  }
+}
+
 class Session {
-  constructor(name, ws) {
+  constructor(name, label, ws) {
     this.name = name;
+    this.label = label || null;
     this.ws = ws;
     this.dead = false;
     this.destroying = false;
@@ -187,17 +209,21 @@ class Session {
 
     this.tab = document.createElement("div");
     this.tab.className = "tab";
+    this.tab.title = "双击重命名";
     this.tab.innerHTML =
       `<span class="dot"></span><span class="label"></span><button class="close" title="关闭标签（会话保留，可随时恢复）">×</button>`;
-    this.tab.querySelector(".label").textContent = tabLabel(name);
+    this.tab.querySelector(".label").textContent = sessLabel(this);
     this.tab.addEventListener("click", () => {
       if (this.dead) {          // 点击已断开的标签 => 重连同名会话
-        const n = this.name;
+        const n = this.name, lbl = this.label;
         this.dispose(true);
-        openSession(n);
+        openSession(n, lbl);
       } else {
         this.activate();
       }
+    });
+    this.tab.addEventListener("dblclick", () => {
+      if (!this.dead) renameSession(this);
     });
     this.tab.querySelector(".close").addEventListener("click", (e) => {
       e.stopPropagation();
@@ -234,8 +260,9 @@ class Session {
 
   onClosed() {
     if (this.destroying) {   // 手动销毁：直接移除标签
+      const label = sessLabel(this);
       this.dispose(true);
-      toast(`${tabLabel(this.name)} 已销毁`);
+      toast(`${label} 已销毁`);
       return;
     }
     if (this.dead) return;
@@ -296,7 +323,7 @@ function showEmpty() {
 
 /* ---------- 会话打开 / 新建 / 销毁 ---------- */
 
-function openSession(name, onFail) {
+function openSession(name, label) {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.binaryType = "arraybuffer";
@@ -314,21 +341,19 @@ function openSession(name, onFail) {
       if (msg.tmux === false) {
         toast("服务器未安装 tmux，此会话断线后无法恢复", true);
       }
-      const s = new Session(name, ws);
+      const s = new Session(name, label, ws);
       sessions.push(s);
       const wanted = localStorage.getItem("sshpro.active");
       if (!active || name === wanted) s.activate();
     } else if (msg.type === "error") {
       settled = true;
       toast(msg.message || "会话打开失败", true);
-      if (onFail) onFail();
     }
   };
   const fail = (text) => () => {
     if (!settled) {
       settled = true;
       toast(text, true);
-      if (onFail) onFail();
     }
   };
   ws.onerror = fail("无法连接 sshpro 服务");
@@ -339,7 +364,7 @@ async function newSession() {
   const taken = new Set(sessions.map((s) => s.name));
   try {
     const r = await fetch("/api/sessions");
-    (await r.json()).sessions.forEach((n) => taken.add(n));
+    (await r.json()).sessions.forEach((x) => taken.add(x.name));
   } catch { /* 服务器列表拿不到就只按本地开着的算 */ }
   let name = "sshpro";
   for (let i = 2; taken.has(name); i++) name = `sshpro-${i}`;
@@ -349,7 +374,7 @@ async function newSession() {
 function destroyActive() {
   if (!active) return;
   const s = active;
-  const label = tabLabel(s.name);
+  const label = sessLabel(s);
   if (!confirm(`彻底销毁 ${label}？其中正在运行的程序都会被终止，且无法恢复。`)) return;
   s.destroying = true;
   fetch(`/api/kill?name=${encodeURIComponent(s.name)}`, { method: "POST" })
@@ -548,17 +573,17 @@ document.addEventListener("keydown", (e) => {
 
 async function init() {
   clearFiles();
-  let names = [];
+  let list = [];
   try {
     const r = await fetch("/api/sessions");
     const data = await r.json();
-    names = data.sessions || [];
+    list = data.sessions || [];
     if (!data.tmux) toast("服务器未安装 tmux，会话断线后无法恢复", true);
   } catch {
     toast("无法获取会话列表", true);
   }
-  if (!names.length) names = ["sshpro"];
-  names.forEach((n) => openSession(n));
+  if (!list.length) list = [{ name: "sshpro", label: "" }];
+  list.forEach((x) => openSession(x.name, x.label));
 }
 
 init();

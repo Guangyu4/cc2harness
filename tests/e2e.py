@@ -83,7 +83,7 @@ class E2ETest(tornado.testing.AsyncHTTPTestCase):
             assert resp.code == 200, (path, resp.code)
             assert len(resp.body) > 100, path
         resp = await client.fetch(self.get_url("/"))
-        assert b"sshpro" in resp.body
+        assert b"<title>A/</title>" in resp.body
 
     @tornado.testing.gen_test(timeout=40)
     async def test_recovery(self):
@@ -108,7 +108,17 @@ class E2ETest(tornado.testing.AsyncHTTPTestCase):
         resp = await client.fetch(self.get_url("/api/sessions"))
         data = json.loads(resp.body)
         assert data["tmux"] is True
-        assert "sshpro-9" in data["sessions"], data
+        names = [s["name"] for s in data["sessions"]]
+        assert "sshpro-9" in names, data
+
+        # 重命名：写入 @label 后列表应带回自定义名称
+        resp = await client.fetch(
+            self.get_url("/api/rename?name=sshpro-9&label=%E8%AE%AD%E7%BB%83%E6%9C%BA"),
+            method="POST", body=b"")
+        assert json.loads(resp.body)["ok"] is True
+        resp = await client.fetch(self.get_url("/api/sessions"))
+        labels = {s["name"]: s["label"] for s in json.loads(resp.body)["sessions"]}
+        assert labels["sshpro-9"] == "训练机", labels
 
         resp = await client.fetch(self.get_url("/api/kill?name=sshpro-9"),
                                   method="POST", body=b"")
@@ -125,7 +135,8 @@ class E2ETest(tornado.testing.AsyncHTTPTestCase):
         assert saw_closed
 
         resp = await client.fetch(self.get_url("/api/sessions"))
-        assert "sshpro-9" not in json.loads(resp.body)["sessions"]
+        assert "sshpro-9" not in [s["name"] for s in
+                                  json.loads(resp.body)["sessions"]]
 
         # 非法会话名应被拒绝
         resp = await client.fetch(self.get_url("/api/kill?name=../evil"),
