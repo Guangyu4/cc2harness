@@ -344,8 +344,6 @@ function destroyActive() {
 
 /* ---------- 文件面板 ---------- */
 
-const VIEWABLE = /(\.txt|\.log(\.\d+)?|\.out)$/i;
-
 function fpParent(p) {
   const q = (p || "/").replace(/\/+$/, "");
   const i = q.lastIndexOf("/");
@@ -421,14 +419,6 @@ function renderFiles(s) {
     } else {
       const act = document.createElement("span");
       act.className = "fp-act";
-      if (VIEWABLE.test(ent.name)) {
-        const v = document.createElement("button");
-        v.className = "fp-btn";
-        v.textContent = "查看";
-        v.title = "在线查看";
-        v.addEventListener("click", (e) => { e.stopPropagation(); openViewer(full); });
-        act.appendChild(v);
-      }
       const d = document.createElement("button");
       d.className = "fp-btn";
       d.textContent = "⬇";
@@ -436,10 +426,9 @@ function renderFiles(s) {
       d.addEventListener("click", (e) => { e.stopPropagation(); download(full); });
       act.appendChild(d);
       row.appendChild(act);
-      if (VIEWABLE.test(ent.name)) {
-        row.classList.add("viewable");
-        row.addEventListener("click", () => openViewer(full));
-      }
+      // 点击任意文件尝试在线查看：文本/二进制由服务端按内容判断
+      row.classList.add("viewable");
+      row.addEventListener("click", () => openViewer(full));
     }
     frag.appendChild(row);
   }

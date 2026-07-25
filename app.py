@@ -123,15 +123,24 @@ def fs_list(path):
     return {"path": path, "entries": entries}
 
 
+class BinaryFileError(Exception):
+    pass
+
+
 def fs_read_text(path, limit=VIEW_LIMIT):
     """读取文本内容；超过 limit 时取末尾（日志通常关心最新部分）。
+    以内容嗅探判断文本/二进制（不看后缀），二进制抛 BinaryFileError。
     返回 (跳过的字节数, 文本)。"""
     with open(path, "rb") as f:
         size = os.fstat(f.fileno()).st_size
+        if b"\x00" in f.read(4096):
+            raise BinaryFileError(path)
         skipped = 0
         if size > limit:
             skipped = size - limit
             f.seek(skipped)
+        else:
+            f.seek(0)
         data = f.read(limit)
     for enc in ("utf-8", "gbk"):
         try:
@@ -315,6 +324,9 @@ class FsHandler(tornado.web.RequestHandler):
                 self.write(text)
             else:
                 await self._download(path, loop)
+        except BinaryFileError:
+            self.set_status(415)
+            self.write({"error": "这是二进制文件，无法在线查看，请下载"})
         except FileNotFoundError:
             self.set_status(404)
             self.write({"error": "文件不存在"})

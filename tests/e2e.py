@@ -165,6 +165,25 @@ class E2ETest(tornado.testing.AsyncHTTPTestCase):
             raise_error=False)
         assert resp.code == 404
 
+        # 文本判断按内容而非后缀：md / py / 无后缀均可查看
+        for fname, body in (("a.md", "# 标题\n正文\n"),
+                            ("b.py", "print('hi')\n"),
+                            ("Makefile", "all:\n\techo ok\n")):
+            p = os.path.join(tmpd, fname)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(body)
+            resp = await client.fetch(self.get_url("/api/fs/view?path=%s" % q(p)))
+            assert resp.body.decode("utf-8") == body, fname
+
+        # 二进制文件 => 415 提示下载
+        binp = os.path.join(tmpd, "data.bin")
+        with open(binp, "wb") as f:
+            f.write(b"\x7fELF\x00\x01\x02binary")
+        resp = await client.fetch(self.get_url("/api/fs/view?path=%s" % q(binp)),
+                                  raise_error=False)
+        assert resp.code == 415
+        assert "二进制" in json.loads(resp.body)["error"]
+
 
 if __name__ == "__main__":
     import unittest
