@@ -18,12 +18,19 @@
 """
 
 import argparse
+import fcntl
 import json
 import logging
 import os
+import pty
+import shlex
+import shutil
 import socket
+import struct
+import subprocess
 import threading
 import time
+import termios
 
 import paramiko
 import tornado.ioloop
@@ -48,6 +55,22 @@ STATS_CMD = (
     "cat /proc/net/dev; echo @@@; "
     "cat /proc/uptime"
 )
+
+
+def default_local_cmd():
+    """本机会话的启动命令。优先 tmux：断开连接只是分离（detach），
+    正在运行的命令继续执行，重新打开页面时 -A 自动接回同一会话。"""
+    if shutil.which("tmux"):
+        return ["tmux", "new-session", "-A", "-s", "sshpro"]
+    return [os.environ.get("SHELL", "/bin/bash"), "-l"]
+
+
+LOCAL_CMD = default_local_cmd()
+LOCAL_ENABLED = True
+
+
+def set_winsize(fd, cols, rows):
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
 def parse_stats(raw):
@@ -115,6 +138,9 @@ class TermHandler(tornado.websocket.WebSocketHandler):
         self.loop = tornado.ioloop.IOLoop.current()
         self.ssh = None
         self.chan = None
+        self.mode = None          # "ssh" | "local"
+        self.pty_fd = None
+        self.pty_pid = None
         self.authed = False
         self.closed = False
         self.stop_evt = threading.Event()
@@ -128,20 +154,83 @@ class TermHandler(tornado.websocket.WebSocketHandler):
         if not self.authed:
             if mtype == "auth":
                 self.authed = True  # 防止重复 auth
-                threading.Thread(target=self._connect, args=(msg,), daemon=True).start()
+                if msg.get("local"):
+                    if LOCAL_ENABLED:
+                        self._connect_local(msg)
+                    else:
+                        self._send_json({"type": "error",
+                                         "message": "本机会话已被禁用（--no-local）"})
+                        self.close()
+                else:
+                    threading.Thread(target=self._connect, args=(msg,),
+                                     daemon=True).start()
             return
-        if mtype == "data" and self.chan:
+        if mtype == "data":
             try:
-                self.chan.send(msg.get("data", "").encode())
+                if self.pty_fd is not None:
+                    os.write(self.pty_fd, msg.get("data", "").encode())
+                elif self.chan:
+                    self.chan.send(msg.get("data", "").encode())
             except OSError:
                 pass
-        elif mtype == "resize" and self.chan:
+        elif mtype == "resize":
             try:
-                self.chan.resize_pty(width=int(msg["cols"]), height=int(msg["rows"]))
+                cols, rows = int(msg["cols"]), int(msg["rows"])
+                if self.pty_fd is not None:
+                    set_winsize(self.pty_fd, cols, rows)
+                elif self.chan:
+                    self.chan.resize_pty(width=cols, height=rows)
             except (OSError, KeyError, ValueError):
                 pass
 
+    def _connect_local(self, msg):
+        """本机会话：直接 fork 一个 PTY 运行 LOCAL_CMD（默认 tmux），无需密码。
+        在 IOLoop 线程内调用。"""
+        cols = int(msg.get("cols") or 80)
+        rows = int(msg.get("rows") or 24)
+        try:
+            pid, fd = pty.fork()
+        except OSError as e:
+            self._send_json({"type": "error", "message": "本机会话启动失败：%s" % e})
+            self.close()
+            return
+        if pid == 0:  # 子进程：立即 exec，绝不返回
+            try:
+                os.environ["TERM"] = "xterm-256color"
+                os.environ.setdefault("LANG", "C.UTF-8")
+                os.chdir(os.path.expanduser("~"))
+                os.execvp(LOCAL_CMD[0], LOCAL_CMD)
+            except Exception:
+                os._exit(127)
+        self.mode = "local"
+        self.pty_pid = pid
+        self.pty_fd = fd
+        try:
+            set_winsize(fd, cols, rows)
+        except OSError:
+            pass
+        self._send_json({"type": "ready"})
+        threading.Thread(target=self._read_loop_local, daemon=True).start()
+        threading.Thread(target=self._monitor_loop, daemon=True).start()
+        logging.info("local session up: %s", " ".join(LOCAL_CMD))
+
     # ---- 以下方法运行在工作线程，回传均通过 loop.add_callback ----
+
+    def _read_loop_local(self):
+        fd = self.pty_fd
+        try:
+            while not self.closed:
+                data = os.read(fd, 65536)
+                if not data:
+                    break
+                self.loop.add_callback(self._send_bytes, data)
+        except OSError:
+            pass  # 子进程退出后 read 抛 EIO，属正常路径
+        try:
+            os.waitpid(self.pty_pid, 0)
+        except (ChildProcessError, OSError):
+            pass
+        self.loop.add_callback(self._shell_closed)
 
     def _connect(self, msg):
         host = str(msg.get("host", "")).strip()
@@ -165,6 +254,7 @@ class TermHandler(tornado.websocket.WebSocketHandler):
         except (paramiko.SSHException, socket.error, OSError) as e:
             self._fail("连接失败：%s" % e)
             return
+        self.mode = "ssh"
         self.ssh = ssh
         self.chan = chan
         self.loop.add_callback(self._send_json, {"type": "ready"})
@@ -243,6 +333,13 @@ class TermHandler(tornado.websocket.WebSocketHandler):
                 self.loop.add_callback(self._send_json, stats)
 
     def _exec(self, cmd, timeout=8):
+        if self.mode == "local":
+            try:
+                r = subprocess.run(["sh", "-c", cmd], capture_output=True,
+                                   timeout=timeout)
+                return r.stdout.decode("utf-8", "replace")
+            except (OSError, subprocess.SubprocessError):
+                return None
         try:
             chan = self.ssh.get_transport().open_session(timeout=timeout)
             chan.settimeout(timeout)
@@ -280,6 +377,12 @@ class TermHandler(tornado.websocket.WebSocketHandler):
     def on_close(self):
         self.closed = True
         self.stop_evt.set()
+        if self.pty_fd is not None:
+            try:
+                os.close(self.pty_fd)  # tmux 客户端收到 SIGHUP 分离，会话继续存活
+            except OSError:
+                pass
+            self.pty_fd = None
         for res in (self.chan, self.ssh):
             if res is not None:
                 try:
@@ -301,7 +404,17 @@ def main():
     parser.add_argument("--host", default="127.0.0.1",
                         help="监听地址（默认仅本机；局域网访问用 0.0.0.0，注意加防护）")
     parser.add_argument("--port", type=int, default=8022, help="监听端口（默认 8022）")
+    parser.add_argument("--no-local", action="store_true",
+                        help="禁用免密的本机会话（例如监听 0.0.0.0 时务必开启）")
+    parser.add_argument("--local-cmd", default=None,
+                        help='本机会话启动命令（默认自动选择 tmux，如 --local-cmd "bash -l"）')
     args = parser.parse_args()
+
+    global LOCAL_ENABLED, LOCAL_CMD
+    if args.no_local:
+        LOCAL_ENABLED = False
+    if args.local_cmd:
+        LOCAL_CMD = shlex.split(args.local_cmd)
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")

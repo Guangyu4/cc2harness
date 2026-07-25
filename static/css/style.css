@@ -294,7 +294,7 @@ body {
   word-break: break-all;
 }
 
-#btn-connect, #btn-cancel {
+#btn-connect, #btn-cancel, #btn-local {
   width: 100%;
   border: none;
   border-radius: 8px;
@@ -314,13 +314,14 @@ body {
   filter: grayscale(0.6) brightness(0.7);
   cursor: wait;
 }
-#btn-cancel {
+#btn-cancel, #btn-local {
   margin-top: 10px;
   background: var(--panel2);
   border: 1px solid var(--border);
   color: var(--dim);
 }
-#btn-cancel:hover { color: var(--text); }
+#btn-local { letter-spacing: 1px; }
+#btn-cancel:hover, #btn-local:hover { color: var(--text); }
 
 /* xterm 滚动条 & 细节 */
 .xterm .xterm-viewport { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }

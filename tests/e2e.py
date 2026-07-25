@@ -98,6 +98,8 @@ class E2ETest(tornado.testing.AsyncHTTPTestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.sshd_port = start_fake_sshd()
+        # 测试环境不用 tmux（避免在开发机上留下测试会话），直接用 bash
+        sshpro_app.LOCAL_CMD = ["bash"]
 
     def get_app(self):
         return sshpro_app.make_app()
@@ -163,6 +165,33 @@ class E2ETest(tornado.testing.AsyncHTTPTestCase):
         assert b"WELCOME-FAKE-SSHD" in term_bytes, term_bytes
         assert b"echo:hello" in term_bytes, term_bytes
         assert ws_open
+        ws.close()
+
+    @tornado.testing.gen_test(timeout=30)
+    async def test_local_shell(self):
+        ws = await tornado.websocket.websocket_connect(self.ws_url())
+        ws.write_message(json.dumps(
+            {"type": "auth", "local": True, "cols": 80, "rows": 24}))
+        got_ready = False
+        buf = b""
+        for _ in range(80):
+            msg = await ws.read_message()
+            if msg is None:
+                break
+            if isinstance(msg, bytes):
+                buf += msg
+            else:
+                data = json.loads(msg)
+                assert data["type"] != "error", data
+                if data["type"] == "ready":
+                    got_ready = True
+                    # 期望值用算式拼出来，避免命令回显本身干扰断言
+                    ws.write_message(json.dumps(
+                        {"type": "data", "data": "echo L0CAL-$((40+2))\n"}))
+            if b"L0CAL-42" in buf:
+                break
+        assert got_ready, "never got ready"
+        assert b"L0CAL-42" in buf, buf
         ws.close()
 
 

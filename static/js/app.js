@@ -43,6 +43,34 @@ function setBar(el, pct) {
   el.className = pct >= 90 ? "bad" : pct >= 70 ? "warn" : "";
 }
 
+/* ---------- 剪贴板 ---------- */
+
+function copyFallback(text) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); } catch { /* noop */ }
+  ta.remove();
+  if (active) active.term.focus();
+}
+
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).catch(() => copyFallback(text));
+  } else {
+    copyFallback(text);
+  }
+}
+
+/* 强制选择模式：即使远端程序（vim/htop/tmux 等）接管了鼠标，
+   划词依然走本地选择——原理是给鼠标事件强行加上 Shift（macOS 为 Option），
+   等效于终端里常用的 Shift+拖选，但不需要真的按住。 */
+let forceSelect = localStorage.getItem("sshpro.forcesel") !== "0";
+const FORCE_PROP = /Mac/.test(navigator.platform) ? "altKey" : "shiftKey";
+
 /* ---------- 最近连接记录（不含密码） ---------- */
 
 function loadRecents() {
@@ -87,6 +115,7 @@ class Session {
       cursorBlink: true,
       scrollback: 10000,
       allowProposedApi: true,
+      altClickMovesCursor: false,
     });
     this.fit = new FitAddon.FitAddon();
     this.term.loadAddon(this.fit);
@@ -98,6 +127,37 @@ class Session {
       }
     });
 
+    // 强制选择：捕获阶段给鼠标事件打上修饰键标记，xterm 便始终走本地划选
+    const forceShift = (e) => {
+      if (forceSelect && !e[FORCE_PROP]) {
+        Object.defineProperty(e, FORCE_PROP, { get: () => true });
+      }
+    };
+    for (const type of ["mousedown", "mousemove", "mouseup", "dblclick"]) {
+      this.holder.addEventListener(type, forceShift, true);
+    }
+
+    // 选中即复制（拖选结束后自动写入剪贴板）
+    this._selTimer = null;
+    this.term.onSelectionChange(() => {
+      clearTimeout(this._selTimer);
+      this._selTimer = setTimeout(() => {
+        const sel = this.term.getSelection();
+        if (sel) copyText(sel);
+      }, 250);
+    });
+
+    // 有选中内容时 Ctrl+C = 复制（不发 SIGINT），无选中时照常中断
+    this.term.attachCustomKeyEventHandler((e) => {
+      if (e.type === "keydown" && e.ctrlKey && !e.altKey &&
+          (e.key === "c" || e.key === "C") && this.term.hasSelection()) {
+        copyText(this.term.getSelection());
+        this.term.clearSelection();
+        return false;
+      }
+      return true;
+    });
+
     this.resizeObs = new ResizeObserver(() => this.refit());
     this.resizeObs.observe(this.holder);
 
@@ -105,7 +165,8 @@ class Session {
     this.tab.className = "tab";
     this.tab.innerHTML =
       `<span class="dot"></span><span class="label"></span><button class="close" title="关闭">×</button>`;
-    this.tab.querySelector(".label").textContent = `${opts.username}@${opts.host}`;
+    this.tab.querySelector(".label").textContent =
+      opts.local ? "本机" : `${opts.username}@${opts.host}`;
     this.tab.addEventListener("click", () => this.activate());
     this.tab.querySelector(".close").addEventListener("click", (e) => {
       e.stopPropagation();
@@ -127,6 +188,9 @@ class Session {
     try { msg = JSON.parse(ev.data); } catch { return; }
     if (msg.type === "sysinfo") {
       this.sysinfo = msg;
+      if (this.opts.local && msg.hostname) {
+        this.tab.querySelector(".label").textContent = "本机 · " + msg.hostname;
+      }
       if (active === this) renderSysinfo(this);
     } else if (msg.type === "stats") {
       this.stats = msg;
@@ -162,7 +226,9 @@ class Session {
     if (this.dead) return;
     this.dead = true;
     this.tab.classList.add("dead");
-    this.term.write("\r\n\x1b[1;31m✖ 连接已断开\x1b[0m（关闭标签页后可重新连接）\r\n");
+    this.term.write(this.opts.local
+      ? "\r\n\x1b[1;33m⏸ 连接已断开\x1b[0m —— 后台命令仍在 tmux 会话中运行，刷新页面即可接回\r\n"
+      : "\r\n\x1b[1;31m✖ 连接已断开\x1b[0m（关闭标签页后可重新连接）\r\n");
   }
 
   dispose() {
@@ -252,6 +318,38 @@ function renderStats(s) {
 }
 
 /* ---------- 登录 / 连接流程 ---------- */
+
+function connectLocal() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+  let settled = false;
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: "auth", local: true, cols: 80, rows: 24 }));
+  };
+  ws.onmessage = (ev) => {
+    if (settled || ev.data instanceof ArrayBuffer) return;
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.type === "ready") {
+      settled = true;
+      hideLogin();
+      const session = new Session({ local: true }, ws);
+      sessions.push(session);
+      session.activate();
+    } else if (msg.type === "error") {
+      settled = true;
+      showLogin(sessions.length > 0);
+      loginError(msg.message || "本机会话不可用");
+    }
+  };
+  const fail = (text) => () => {
+    if (!settled) { settled = true; showLogin(sessions.length > 0); loginError(text); }
+  };
+  ws.onerror = fail("无法连接 sshpro 服务");
+  ws.onclose = fail("连接被服务端关闭");
+}
 
 function showLogin(cancellable) {
   $("#login-overlay").classList.remove("hidden");
@@ -343,6 +441,15 @@ $("#btn-cancel").addEventListener("click", () => {
   $("#login-overlay").classList.add("hidden");
   if (active) active.term.focus();
 });
+$("#btn-local").addEventListener("click", () => connectLocal());
+
+$("#btn-copy").addEventListener("click", () => {
+  forceSelect = !forceSelect;
+  localStorage.setItem("sshpro.forcesel", forceSelect ? "1" : "0");
+  $("#btn-copy").classList.toggle("on", forceSelect);
+  if (active) active.term.focus();
+});
+if (forceSelect) $("#btn-copy").classList.add("on");
 
 $("#btn-monitor").addEventListener("click", () => {
   const hidden = $("#monitor").classList.toggle("hidden");
@@ -358,9 +465,10 @@ if (localStorage.getItem("sshpro.monitor") === "0") {
 }
 
 window.addEventListener("beforeunload", (e) => {
-  if (sessions.some((s) => !s.dead)) e.preventDefault();
+  // 本机会话跑在 tmux 里，关页面不丢任务，无需拦截
+  if (sessions.some((s) => !s.dead && !s.opts.local)) e.preventDefault();
 });
 
 renderRecents();
 clearMonitor();
-showLogin(false);
+connectLocal();
