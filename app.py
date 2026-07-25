@@ -191,7 +191,11 @@ class TermHandler(tornado.websocket.WebSocketHandler):
 
     def _spawn(self, name, cols, rows):
         if TMUX:
-            cmd = tmux_cmd("new-session", "-A", "-s", name)
+            # 附加后开启鼠标模式：滚轮直接滚动 tmux 历史（触控板平滑），
+            # 否则滚轮会被转成方向键连发；顺带调大历史行数
+            cmd = tmux_cmd("new-session", "-A", "-s", name,
+                           ";", "set-option", "-g", "mouse", "on",
+                           ";", "set-option", "-g", "history-limit", "50000")
         else:  # 无 tmux 的退化模式：普通 shell，无法断线恢复
             cmd = [os.environ.get("SHELL", "/bin/bash"), "-l"]
         try:

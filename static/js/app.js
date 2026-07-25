@@ -110,6 +110,7 @@ class Session {
       altClickMovesCursor: false,
       // macOS 上强制划选走 Option 修饰键，且必须显式打开这个开关
       macOptionClickForcesSelection: true,
+      smoothScrollDuration: 120,   // 本地滚动加缓动，触控板不再一格一格跳
     });
     this.fit = new FitAddon.FitAddon();
     this.term.loadAddon(this.fit);
