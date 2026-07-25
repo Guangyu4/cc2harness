@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
-"""sshpro — FinalShell 风格的网页版 SSH 终端。
+"""sshpro — 基于 tmux 的网页终端。
 
-浏览器 (xterm.js) <--WebSocket--> tornado <--paramiko--> 远程 SSH 服务器
+浏览器 (xterm.js) <--WebSocket--> tornado <--PTY--> tmux 会话
 
-协议（一个 WebSocket 对应一次 SSH 会话）：
+每个标签页对应一个独立的 tmux 会话（sshpro / sshpro-2 / ...）：
+断开连接、关闭浏览器只是「分离」，命令继续运行；重新打开页面自动恢复；
+只有手动销毁（kill-session）才会真正结束会话。
+
+WebSocket 协议（一个连接对应一个会话标签）：
   客户端 -> 服务端（JSON 文本帧）:
-    {"type": "auth", "host", "port", "username", "password", "cols", "rows"}
+    {"type": "auth", "session": "sshpro-2", "cols": N, "rows": N}
     {"type": "data", "data": "..."}          # 键盘输入
     {"type": "resize", "cols": N, "rows": N}
   服务端 -> 客户端:
-    二进制帧                                  # 终端原始输出（UTF-8 字节流，交给 xterm 解码）
-    {"type": "ready"}                        # 认证成功，shell 已就绪
-    {"type": "error", "message": "..."}      # 连接/认证失败
-    {"type": "sysinfo", ...}                 # 主机静态信息（hostname / 内核 / 核数 / 发行版）
-    {"type": "stats", ...}                   # 周期性资源占用（CPU / 内存 / 磁盘 / 网络）
-    {"type": "closed"}                       # 远端 shell 已退出
+    二进制帧                                  # 终端原始输出（UTF-8 字节流）
+    {"type": "ready", "session": "..."}      # PTY 已就绪
+    {"type": "error", "message": "..."}
+    {"type": "cwd", "path": "/..."}          # 终端当前目录变化（供文件面板跟随）
+    {"type": "closed"}                       # 会话进程退出 / 被销毁
+
+HTTP 接口：
+    GET  /api/sessions                        # 列出可恢复的 tmux 会话
+    POST /api/kill?name=sshpro-2              # 彻底销毁一个会话
+    GET  /api/fs/list?path=/a                 # 文件面板：目录列表
+    GET  /api/fs/view?path=/a/b.log           # 在线查看（大文件取末尾）
+    GET  /api/fs/download?path=/a/b           # 下载
 """
 
 import argparse
@@ -23,16 +33,16 @@ import json
 import logging
 import os
 import pty
-import shlex
+import re
 import shutil
-import socket
+import signal
 import struct
 import subprocess
 import threading
-import time
 import termios
+import urllib.parse
+import uuid
 
-import paramiko
 import tornado.ioloop
 import tornado.web
 import tornado.websocket
@@ -40,105 +50,102 @@ import tornado.websocket
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
-STATS_INTERVAL = 2.5  # 秒
+CWD_INTERVAL = 2.0             # 终端目录轮询间隔（秒）
+VIEW_LIMIT = 2 * 1024 * 1024   # 在线查看最多返回字节数（大日志取末尾）
 
-INFO_CMD = (
-    "hostname; uname -r; nproc; "
-    "(. /etc/os-release 2>/dev/null && echo \"$PRETTY_NAME\") || uname -s"
-)
+SESSION_PREFIX = "sshpro"
+NAME_RE = re.compile(r"^sshpro[A-Za-z0-9_-]{0,32}$")
 
-STATS_CMD = (
-    "head -1 /proc/stat; echo @@@; "
-    "cat /proc/meminfo; echo @@@; "
-    "df -PB1; echo @@@; "
-    "cat /proc/loadavg; echo @@@; "
-    "cat /proc/net/dev; echo @@@; "
-    "cat /proc/uptime"
-)
+TMUX = shutil.which("tmux")
+TMUX_SOCKET = None             # tmux -L 的 socket 名（测试隔离用）
+
+SESSIONS = {}                  # sid -> TermHandler
 
 
-def default_local_cmd():
-    """本机会话的启动命令。优先 tmux：断开连接只是分离（detach），
-    正在运行的命令继续执行，重新打开页面时 -A 自动接回同一会话。"""
-    if shutil.which("tmux"):
-        return ["tmux", "new-session", "-A", "-s", "sshpro"]
-    return [os.environ.get("SHELL", "/bin/bash"), "-l"]
+def tmux_cmd(*args):
+    cmd = [TMUX]
+    if TMUX_SOCKET:
+        cmd += ["-L", TMUX_SOCKET]
+    cmd += list(args)
+    return cmd
 
 
-LOCAL_CMD = default_local_cmd()
-LOCAL_ENABLED = True
+def tmux_run(*args, timeout=5):
+    try:
+        r = subprocess.run(tmux_cmd(*args), capture_output=True, timeout=timeout)
+        return r.returncode, r.stdout.decode("utf-8", "replace")
+    except (OSError, subprocess.SubprocessError):
+        return 1, ""
+
+
+def list_tmux_sessions():
+    if not TMUX:
+        return []
+    code, out = tmux_run("list-sessions", "-F", "#{session_name}")
+    if code != 0:  # tmux server 未运行 => 无会话
+        return []
+    return sorted(n for n in out.splitlines() if NAME_RE.match(n))
+
+
+def kill_session(name):
+    """彻底销毁会话。tmux 模式杀 tmux 会话；退化模式给对应 shell 发 SIGHUP。"""
+    if TMUX:
+        code, _ = tmux_run("kill-session", "-t", "=" + name)
+        return code == 0
+    for h in list(SESSIONS.values()):
+        if h.name == name and h.pty_pid:
+            try:
+                os.kill(h.pty_pid, signal.SIGHUP)
+            except OSError:
+                pass
+            return True
+    return False
 
 
 def set_winsize(fd, cols, rows):
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
-def parse_stats(raw):
-    """把 STATS_CMD 的输出解析成结构化数据；任何一段解析失败都跳过该段。"""
-    parts = raw.split("@@@")
-    out = {}
-    try:  # /proc/stat 第一行: cpu user nice system idle iowait irq softirq steal ...
-        fields = parts[0].split()
-        if fields and fields[0] == "cpu":
-            out["cpu_ticks"] = [int(x) for x in fields[1:]]
-    except (IndexError, ValueError):
-        pass
-    try:  # /proc/meminfo（单位 kB）
-        mem = {}
-        for line in parts[1].splitlines():
-            if ":" in line:
-                key, val = line.split(":", 1)
-                mem[key.strip()] = int(val.split()[0]) * 1024
-        out["mem"] = {
-            "total": mem.get("MemTotal", 0),
-            "avail": mem.get("MemAvailable", mem.get("MemFree", 0)),
-            "swap_total": mem.get("SwapTotal", 0),
-            "swap_free": mem.get("SwapFree", 0),
-        }
-    except (IndexError, ValueError):
-        pass
-    try:  # df -PB1
-        disks, seen = [], set()
-        for line in parts[2].splitlines()[1:]:
-            f = line.split()
-            if len(f) >= 6 and f[0].startswith("/dev/") and "loop" not in f[0]:
-                if f[5] not in seen:
-                    seen.add(f[5])
-                    disks.append({"mount": f[5], "total": int(f[1]), "used": int(f[2])})
-        disks.sort(key=lambda d: d["total"], reverse=True)
-        out["disks"] = disks[:4]
-    except (IndexError, ValueError):
-        pass
-    try:
-        out["load"] = [float(x) for x in parts[3].split()[:3]]
-    except (IndexError, ValueError):
-        pass
-    try:  # /proc/net/dev：除 lo 外所有网卡收发字节合计
-        rx = tx = 0
-        for line in parts[4].splitlines():
-            if ":" in line:
-                name, data = line.split(":", 1)
-                if name.strip() == "lo":
-                    continue
-                f = data.split()
-                rx += int(f[0])
-                tx += int(f[8])
-        out["net"] = {"rx": rx, "tx": tx}
-    except (IndexError, ValueError):
-        pass
-    try:
-        out["uptime"] = float(parts[5].split()[0])
-    except (IndexError, ValueError):
-        pass
-    return out
+# ---------- 文件面板（本机文件系统） ----------
+
+def fs_list(path):
+    path = os.path.abspath(path or os.path.expanduser("~"))
+    entries = []
+    with os.scandir(path) as it:
+        for e in it:
+            try:
+                is_dir = e.is_dir(follow_symlinks=True)
+                size = 0 if is_dir else e.stat(follow_symlinks=False).st_size
+            except OSError:
+                continue
+            entries.append({"name": e.name, "dir": is_dir, "size": size})
+    entries.sort(key=lambda x: (not x["dir"], x["name"].lower()))
+    return {"path": path, "entries": entries}
+
+
+def fs_read_text(path, limit=VIEW_LIMIT):
+    """读取文本内容；超过 limit 时取末尾（日志通常关心最新部分）。
+    返回 (跳过的字节数, 文本)。"""
+    with open(path, "rb") as f:
+        size = os.fstat(f.fileno()).st_size
+        skipped = 0
+        if size > limit:
+            skipped = size - limit
+            f.seek(skipped)
+        data = f.read(limit)
+    for enc in ("utf-8", "gbk"):
+        try:
+            return skipped, data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return skipped, data.decode("utf-8", "replace")
 
 
 class TermHandler(tornado.websocket.WebSocketHandler):
     def open(self):
         self.loop = tornado.ioloop.IOLoop.current()
-        self.ssh = None
-        self.chan = None
-        self.mode = None          # "ssh" | "local"
+        self.name = None
+        self.sid = None
         self.pty_fd = None
         self.pty_pid = None
         self.authed = False
@@ -153,45 +160,35 @@ class TermHandler(tornado.websocket.WebSocketHandler):
         mtype = msg.get("type")
         if not self.authed:
             if mtype == "auth":
-                self.authed = True  # 防止重复 auth
-                if msg.get("local"):
-                    if LOCAL_ENABLED:
-                        self._connect_local(msg)
-                    else:
-                        self._send_json({"type": "error",
-                                         "message": "本机会话已被禁用（--no-local）"})
-                        self.close()
-                else:
-                    threading.Thread(target=self._connect, args=(msg,),
-                                     daemon=True).start()
+                self.authed = True
+                name = str(msg.get("session") or SESSION_PREFIX)
+                if not NAME_RE.match(name):
+                    self._send_json({"type": "error", "message": "非法的会话名"})
+                    self.close()
+                    return
+                self._spawn(name, int(msg.get("cols") or 80),
+                            int(msg.get("rows") or 24))
             return
-        if mtype == "data":
+        if mtype == "data" and self.pty_fd is not None:
             try:
-                if self.pty_fd is not None:
-                    os.write(self.pty_fd, msg.get("data", "").encode())
-                elif self.chan:
-                    self.chan.send(msg.get("data", "").encode())
+                os.write(self.pty_fd, msg.get("data", "").encode())
             except OSError:
                 pass
-        elif mtype == "resize":
+        elif mtype == "resize" and self.pty_fd is not None:
             try:
-                cols, rows = int(msg["cols"]), int(msg["rows"])
-                if self.pty_fd is not None:
-                    set_winsize(self.pty_fd, cols, rows)
-                elif self.chan:
-                    self.chan.resize_pty(width=cols, height=rows)
+                set_winsize(self.pty_fd, int(msg["cols"]), int(msg["rows"]))
             except (OSError, KeyError, ValueError):
                 pass
 
-    def _connect_local(self, msg):
-        """本机会话：直接 fork 一个 PTY 运行 LOCAL_CMD（默认 tmux），无需密码。
-        在 IOLoop 线程内调用。"""
-        cols = int(msg.get("cols") or 80)
-        rows = int(msg.get("rows") or 24)
+    def _spawn(self, name, cols, rows):
+        if TMUX:
+            cmd = tmux_cmd("new-session", "-A", "-s", name)
+        else:  # 无 tmux 的退化模式：普通 shell，无法断线恢复
+            cmd = [os.environ.get("SHELL", "/bin/bash"), "-l"]
         try:
             pid, fd = pty.fork()
         except OSError as e:
-            self._send_json({"type": "error", "message": "本机会话启动失败：%s" % e})
+            self._send_json({"type": "error", "message": "会话启动失败：%s" % e})
             self.close()
             return
         if pid == 0:  # 子进程：立即 exec，绝不返回
@@ -199,24 +196,26 @@ class TermHandler(tornado.websocket.WebSocketHandler):
                 os.environ["TERM"] = "xterm-256color"
                 os.environ.setdefault("LANG", "C.UTF-8")
                 os.chdir(os.path.expanduser("~"))
-                os.execvp(LOCAL_CMD[0], LOCAL_CMD)
+                os.execvp(cmd[0], cmd)
             except Exception:
                 os._exit(127)
-        self.mode = "local"
+        self.name = name
         self.pty_pid = pid
         self.pty_fd = fd
+        self.sid = uuid.uuid4().hex
+        SESSIONS[self.sid] = self
         try:
             set_winsize(fd, cols, rows)
         except OSError:
             pass
-        self._send_json({"type": "ready"})
-        threading.Thread(target=self._read_loop_local, daemon=True).start()
-        threading.Thread(target=self._monitor_loop, daemon=True).start()
-        logging.info("local session up: %s", " ".join(LOCAL_CMD))
+        self._send_json({"type": "ready", "session": name, "tmux": bool(TMUX)})
+        threading.Thread(target=self._read_loop, daemon=True).start()
+        threading.Thread(target=self._cwd_loop, daemon=True).start()
+        logging.info("session up: %s (%s)", name, " ".join(cmd))
 
     # ---- 以下方法运行在工作线程，回传均通过 loop.add_callback ----
 
-    def _read_loop_local(self):
+    def _read_loop(self):
         fd = self.pty_fd
         try:
             while not self.closed:
@@ -232,127 +231,26 @@ class TermHandler(tornado.websocket.WebSocketHandler):
             pass
         self.loop.add_callback(self._shell_closed)
 
-    def _connect(self, msg):
-        host = str(msg.get("host", "")).strip()
-        port = int(msg.get("port") or 22)
-        username = str(msg.get("username", "")).strip()
-        password = str(msg.get("password", ""))
-        cols = int(msg.get("cols") or 80)
-        rows = int(msg.get("rows") or 24)
-        try:
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(
-                host, port=port, username=username, password=password,
-                timeout=10, auth_timeout=15, banner_timeout=15,
-                allow_agent=False, look_for_keys=False,
-            )
-            chan = ssh.invoke_shell(term="xterm-256color", width=cols, height=rows)
-        except paramiko.AuthenticationException:
-            self._fail("认证失败：用户名或密码错误")
-            return
-        except (paramiko.SSHException, socket.error, OSError) as e:
-            self._fail("连接失败：%s" % e)
-            return
-        self.mode = "ssh"
-        self.ssh = ssh
-        self.chan = chan
-        self.loop.add_callback(self._send_json, {"type": "ready"})
-        threading.Thread(target=self._read_loop, daemon=True).start()
-        threading.Thread(target=self._monitor_loop, daemon=True).start()
-        logging.info("session up: %s@%s:%s", username, host, port)
+    def _cwd_loop(self):
+        """轮询终端当前目录，变化时推送给前端文件面板。"""
+        last = None
+        while not self.stop_evt.wait(CWD_INTERVAL if last else 0.3):
+            path = self._current_cwd()
+            if path and path != last:
+                last = path
+                self.loop.add_callback(self._send_json,
+                                       {"type": "cwd", "path": path})
 
-    def _fail(self, message):
-        logging.warning("connect failed: %s", message)
-        def send_and_close():
-            self._send_json({"type": "error", "message": message})
-            self.close()
-        self.loop.add_callback(send_and_close)
-
-    def _read_loop(self):
-        """远端 shell 输出 -> 浏览器（原始字节，二进制帧）。"""
+    def _current_cwd(self):
+        if TMUX and self.name:
+            code, out = tmux_run("display-message", "-p", "-t", "=" + self.name,
+                                 "#{pane_current_path}", timeout=3)
+            p = out.strip()
+            if code == 0 and p.startswith("/"):
+                return p
         try:
-            while not self.closed:
-                data = self.chan.recv(65536)
-                if not data:
-                    break
-                self.loop.add_callback(self._send_bytes, data)
+            return os.readlink("/proc/%d/cwd" % self.pty_pid)
         except OSError:
-            pass
-        self.loop.add_callback(self._shell_closed)
-
-    def _monitor_loop(self):
-        """周期采集远端资源占用；非 Linux 主机会解析失败并自动静默。"""
-        info = self._exec(INFO_CMD)
-        if info is not None:
-            lines = info.splitlines()
-            if len(lines) >= 4:
-                self.loop.add_callback(self._send_json, {
-                    "type": "sysinfo",
-                    "hostname": lines[0].strip(),
-                    "kernel": lines[1].strip(),
-                    "cores": lines[2].strip(),
-                    "os": lines[3].strip(),
-                })
-        prev = None
-        prev_t = None
-        while not self.stop_evt.wait(STATS_INTERVAL if prev else 0.2):
-            raw = self._exec(STATS_CMD)
-            if raw is None:
-                continue
-            now = time.monotonic()
-            cur = parse_stats(raw)
-            if not cur:
-                return  # 远端没有 /proc，放弃监控
-            stats = {"type": "stats"}
-            if "cpu_ticks" in cur and prev and "cpu_ticks" in prev:
-                d = [a - b for a, b in zip(cur["cpu_ticks"], prev["cpu_ticks"])]
-                total = sum(d)
-                if total > 0:
-                    idle = d[3] + (d[4] if len(d) > 4 else 0)  # idle + iowait
-                    stats["cpu"] = round(100.0 * (total - idle) / total, 1)
-            if "mem" in cur:
-                m = cur["mem"]
-                stats["mem"] = {"total": m["total"], "used": m["total"] - m["avail"]}
-                stats["swap"] = {"total": m["swap_total"],
-                                 "used": m["swap_total"] - m["swap_free"]}
-            if "disks" in cur:
-                stats["disks"] = cur["disks"]
-            if "load" in cur:
-                stats["load"] = cur["load"]
-            if "net" in cur and prev and "net" in prev and prev_t:
-                dt = max(now - prev_t, 0.001)
-                stats["net"] = {
-                    "rx": max(cur["net"]["rx"] - prev["net"]["rx"], 0) / dt,
-                    "tx": max(cur["net"]["tx"] - prev["net"]["tx"], 0) / dt,
-                }
-            if "uptime" in cur:
-                stats["uptime"] = cur["uptime"]
-            prev, prev_t = cur, now
-            if len(stats) > 1:
-                self.loop.add_callback(self._send_json, stats)
-
-    def _exec(self, cmd, timeout=8):
-        if self.mode == "local":
-            try:
-                r = subprocess.run(["sh", "-c", cmd], capture_output=True,
-                                   timeout=timeout)
-                return r.stdout.decode("utf-8", "replace")
-            except (OSError, subprocess.SubprocessError):
-                return None
-        try:
-            chan = self.ssh.get_transport().open_session(timeout=timeout)
-            chan.settimeout(timeout)
-            chan.exec_command(cmd)
-            buf = b""
-            while True:
-                d = chan.recv(65536)
-                if not d:
-                    break
-                buf += d
-            chan.close()
-            return buf.decode("utf-8", "replace")
-        except (paramiko.SSHException, socket.error, OSError, AttributeError):
             return None
 
     # ---- 以下方法只在 IOLoop 线程调用 ----
@@ -377,47 +275,99 @@ class TermHandler(tornado.websocket.WebSocketHandler):
     def on_close(self):
         self.closed = True
         self.stop_evt.set()
+        SESSIONS.pop(self.sid, None)
         if self.pty_fd is not None:
             try:
-                os.close(self.pty_fd)  # tmux 客户端收到 SIGHUP 分离，会话继续存活
+                os.close(self.pty_fd)  # tmux 客户端收 SIGHUP 分离，会话继续存活
             except OSError:
                 pass
             self.pty_fd = None
-        for res in (self.chan, self.ssh):
-            if res is not None:
-                try:
-                    res.close()
-                except OSError:
-                    pass
+
+
+class SessionsHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.write({"tmux": bool(TMUX), "sessions": list_tmux_sessions()})
+
+
+class KillHandler(tornado.web.RequestHandler):
+    def post(self):
+        name = self.get_argument("name", "")
+        if not NAME_RE.match(name):
+            self.set_status(400)
+            self.write({"error": "非法的会话名"})
+            return
+        ok = kill_session(name)
+        self.write({"ok": ok})
+
+
+class FsHandler(tornado.web.RequestHandler):
+    async def get(self, action):
+        path = self.get_argument("path", "")
+        loop = tornado.ioloop.IOLoop.current()
+        try:
+            if action == "list":
+                self.write(await loop.run_in_executor(None, fs_list, path))
+            elif action == "view":
+                skipped, text = await loop.run_in_executor(None, fs_read_text, path)
+                self.set_header("Content-Type", "text/plain; charset=utf-8")
+                if skipped:
+                    self.set_header("X-Sshpro-Skipped", str(skipped))
+                self.write(text)
+            else:
+                await self._download(path, loop)
+        except FileNotFoundError:
+            self.set_status(404)
+            self.write({"error": "文件不存在"})
+        except (PermissionError, IsADirectoryError) as e:
+            self.set_status(403)
+            self.write({"error": "无法访问：%s" % e.strerror})
+        except OSError as e:
+            self.set_status(500)
+            self.write({"error": str(e)})
+
+    async def _download(self, path, loop):
+        f = await loop.run_in_executor(None, open, path, "rb")
+        try:
+            size = os.fstat(f.fileno()).st_size
+            name = os.path.basename(path.rstrip("/")) or "download"
+            self.set_header("Content-Type", "application/octet-stream")
+            self.set_header("Content-Length", str(size))
+            self.set_header("Content-Disposition",
+                            "attachment; filename*=UTF-8''"
+                            + urllib.parse.quote(name))
+            while True:
+                chunk = await loop.run_in_executor(None, f.read, 262144)
+                if not chunk:
+                    break
+                self.write(chunk)
+                await self.flush()
+        finally:
+            f.close()
 
 
 def make_app():
     return tornado.web.Application([
         (r"/ws", TermHandler),
+        (r"/api/sessions", SessionsHandler),
+        (r"/api/kill", KillHandler),
+        (r"/api/fs/(list|view|download)", FsHandler),
         (r"/(.*)", tornado.web.StaticFileHandler,
          {"path": STATIC_DIR, "default_filename": "index.html"}),
     ])
 
 
 def main():
-    parser = argparse.ArgumentParser(description="sshpro — web SSH terminal")
+    parser = argparse.ArgumentParser(description="sshpro — 基于 tmux 的网页终端")
     parser.add_argument("--host", default="127.0.0.1",
-                        help="监听地址（默认仅本机；局域网访问用 0.0.0.0，注意加防护）")
+                        help="监听地址（默认仅本机；页面无认证且可直接拿到 shell，"
+                             "切勿裸露到不可信网络）")
     parser.add_argument("--port", type=int, default=8022, help="监听端口（默认 8022）")
-    parser.add_argument("--no-local", action="store_true",
-                        help="禁用免密的本机会话（例如监听 0.0.0.0 时务必开启）")
-    parser.add_argument("--local-cmd", default=None,
-                        help='本机会话启动命令（默认自动选择 tmux，如 --local-cmd "bash -l"）')
     args = parser.parse_args()
-
-    global LOCAL_ENABLED, LOCAL_CMD
-    if args.no_local:
-        LOCAL_ENABLED = False
-    if args.local_cmd:
-        LOCAL_CMD = shlex.split(args.local_cmd)
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
+    if not TMUX:
+        logging.warning("未找到 tmux：会话将无法断线恢复（建议安装 tmux）")
     app = make_app()
     app.listen(args.port, address=args.host)
     logging.info("sshpro running at http://%s:%d", args.host, args.port)

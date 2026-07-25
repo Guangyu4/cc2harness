@@ -3,97 +3,63 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>sshpro · Web SSH 终端</title>
+<title>sshpro · 网页终端</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
-<link rel="stylesheet" href="vendor/xterm.css">
-<link rel="stylesheet" href="css/style.css">
+<link rel="stylesheet" href="vendor/xterm.css?v=4">
+<link rel="stylesheet" href="css/style.css?v=4">
 </head>
 <body>
 
-<div id="app" hidden>
+<div id="app">
   <header id="topbar">
     <div class="logo">ssh<span>pro</span></div>
     <nav id="tabs"></nav>
-    <button id="btn-new" class="icon-btn" title="新建连接">＋</button>
+    <button id="btn-new" class="icon-btn" title="新建终端（新的 tmux 会话）">＋</button>
     <div class="spacer"></div>
-    <button id="btn-copy" class="icon-btn" title="强制选中复制：开启后即使 vim/htop 等接管鼠标也能直接划词，选中自动复制">⧉</button>
-    <button id="btn-monitor" class="icon-btn" title="显示 / 隐藏监控面板">▥</button>
+    <button id="btn-copy" class="icon-btn" title="强制选中复制：即使 vim/htop 等接管鼠标也能划词，选中自动复制">⧉</button>
+    <button id="btn-files" class="icon-btn" title="显示 / 隐藏文件面板">▥</button>
+    <button id="btn-destroy" class="icon-btn danger" title="彻底销毁当前会话（终止其中运行的程序）">🗑</button>
   </header>
 
   <div id="main">
-    <div id="terms"></div>
-
-    <aside id="monitor">
-      <section class="mon-card" id="mon-host">
-        <h3 id="mon-hostname">—</h3>
-        <div class="mon-kv"><span>系统</span><b id="mon-os">—</b></div>
-        <div class="mon-kv"><span>内核</span><b id="mon-kernel">—</b></div>
-        <div class="mon-kv"><span>CPU 核数</span><b id="mon-cores">—</b></div>
-        <div class="mon-kv"><span>已运行</span><b id="mon-uptime">—</b></div>
-      </section>
-
-      <section class="mon-card">
-        <div class="mon-title">CPU <em id="mon-cpu-pct">—</em></div>
-        <div class="bar"><i id="mon-cpu-bar"></i></div>
-        <div class="mon-sub">负载 <b id="mon-load">—</b></div>
-      </section>
-
-      <section class="mon-card">
-        <div class="mon-title">内存 <em id="mon-mem-pct">—</em></div>
-        <div class="bar"><i id="mon-mem-bar"></i></div>
-        <div class="mon-sub" id="mon-mem-txt">—</div>
-        <div class="mon-title swap-title">Swap <em id="mon-swap-pct">—</em></div>
-        <div class="bar slim"><i id="mon-swap-bar"></i></div>
-      </section>
-
-      <section class="mon-card">
-        <div class="mon-title">磁盘</div>
-        <div id="mon-disks"></div>
-      </section>
-
-      <section class="mon-card">
-        <div class="mon-title">网络</div>
-        <div class="net-row">
-          <div class="net-cell"><span class="net-dir dl">↓ 下行</span><b id="mon-rx">—</b></div>
-          <div class="net-cell"><span class="net-dir ul">↑ 上行</span><b id="mon-tx">—</b></div>
+    <div id="terms">
+      <div id="empty" hidden>
+        <div class="empty-card">
+          <div class="login-logo">ssh<span>pro</span></div>
+          <p>没有打开的终端</p>
+          <button id="btn-empty-new">＋ 新建终端</button>
         </div>
-      </section>
+      </div>
+    </div>
+
+    <aside id="files">
+      <div class="fp-head">
+        <button id="fp-up" class="fp-btn" title="上级目录">↑</button>
+        <div id="fp-path" title="">—</div>
+        <button id="fp-follow" class="fp-btn" title="跟随终端当前目录（手动进入其他目录后点此恢复跟随）">⇄</button>
+        <button id="fp-refresh" class="fp-btn" title="刷新">⟳</button>
+      </div>
+      <div id="fp-list"></div>
     </aside>
   </div>
 </div>
 
-<div id="login-overlay">
-  <form id="login-form" autocomplete="on">
-    <div class="login-logo">ssh<span>pro</span></div>
-    <p class="login-tip">网页版 SSH 终端 · 输入服务器信息即可连接</p>
-    <div class="field-row">
-      <label class="field grow">
-        <span>主机地址</span>
-        <input id="f-host" list="recent-hosts" required placeholder="192.168.1.10" autocapitalize="off" spellcheck="false">
-        <datalist id="recent-hosts"></datalist>
-      </label>
-      <label class="field port">
-        <span>端口</span>
-        <input id="f-port" type="number" min="1" max="65535" value="22" required>
-      </label>
+<div id="viewer" class="hidden">
+  <div class="viewer-card">
+    <div class="viewer-head">
+      <div id="viewer-title">—</div>
+      <button id="viewer-dl" class="fp-btn" title="下载此文件">⬇ 下载</button>
+      <button id="viewer-close" class="fp-btn" title="关闭 (Esc)">✕</button>
     </div>
-    <label class="field">
-      <span>用户名</span>
-      <input id="f-user" required placeholder="root" autocapitalize="off" spellcheck="false">
-    </label>
-    <label class="field">
-      <span>密码</span>
-      <input id="f-pass" type="password" required placeholder="••••••••">
-    </label>
-    <div id="login-error" hidden></div>
-    <button id="btn-connect" type="submit">连 接</button>
-    <button id="btn-local" type="button">⌂ 直接打开本机终端</button>
-    <button id="btn-cancel" type="button" hidden>返 回</button>
-  </form>
+    <div id="viewer-note" hidden></div>
+    <pre id="viewer-body"></pre>
+  </div>
 </div>
 
-<script src="vendor/xterm.js"></script>
-<script src="vendor/addon-fit.js"></script>
-<script src="js/app.js"></script>
+<div id="toast"></div>
+
+<script src="vendor/xterm.js?v=4"></script>
+<script src="vendor/addon-fit.js?v=4"></script>
+<script src="js/app.js?v=4"></script>
 </body>
 </html>

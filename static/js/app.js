@@ -1,4 +1,4 @@
-/* sshpro 前端：标签页会话管理 + xterm.js 终端 + 系统监控面板 */
+/* sshpro 前端：tmux 多会话标签页 + xterm.js 终端 + 目录跟随文件面板 */
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
@@ -16,7 +16,7 @@ const TERM_THEME = {
   brightCyan: "#6bd8e4", brightWhite: "#eaf0f8",
 };
 
-/* ---------- 格式化工具 ---------- */
+/* ---------- 小工具 ---------- */
 
 function fmtBytes(n) {
   if (!isFinite(n)) return "—";
@@ -26,21 +26,14 @@ function fmtBytes(n) {
   return (n >= 100 || i === 0 ? Math.round(n) : n.toFixed(1)) + " " + units[i];
 }
 
-function fmtRate(n) { return fmtBytes(n) + "/s"; }
-
-function fmtUptime(sec) {
-  sec = Math.floor(sec);
-  const d = Math.floor(sec / 86400);
-  const h = Math.floor((sec % 86400) / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  if (d > 0) return `${d} 天 ${h} 小时`;
-  if (h > 0) return `${h} 小时 ${m} 分钟`;
-  return `${m} 分钟`;
-}
-
-function setBar(el, pct) {
-  el.style.width = Math.min(Math.max(pct, 0), 100) + "%";
-  el.className = pct >= 90 ? "bad" : pct >= 70 ? "warn" : "";
+let toastTimer = null;
+function toast(msg, bad) {
+  const el = $("#toast");
+  el.textContent = msg;
+  el.classList.toggle("bad", !!bad);
+  el.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("show"), 2200);
 }
 
 /* ---------- 剪贴板 ---------- */
@@ -51,58 +44,57 @@ function copyFallback(text) {
   ta.style.position = "fixed";
   ta.style.opacity = "0";
   document.body.appendChild(ta);
+  ta.focus();
   ta.select();
-  try { document.execCommand("copy"); } catch { /* noop */ }
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch { ok = false; }
   ta.remove();
   if (active) active.term.focus();
+  if (ok) toast(`已复制 ${text.length} 个字符`);
+  else toast("复制失败：浏览器拦截了剪贴板写入", true);
 }
 
 function copyText(text) {
+  if (!text) return;
   if (navigator.clipboard && window.isSecureContext) {
-    navigator.clipboard.writeText(text).catch(() => copyFallback(text));
+    navigator.clipboard.writeText(text)
+      .then(() => toast(`已复制 ${text.length} 个字符`))
+      .catch(() => copyFallback(text));
   } else {
     copyFallback(text);
   }
 }
 
-/* 强制选择模式：即使远端程序（vim/htop/tmux 等）接管了鼠标，
-   划词依然走本地选择——原理是给鼠标事件强行加上 Shift（macOS 为 Option），
-   等效于终端里常用的 Shift+拖选，但不需要真的按住。 */
+/* 强制选择模式：即使远端程序（vim/htop/claude 等）接管了鼠标，
+   划词依然走本地选择——给鼠标事件强行加上修饰键（macOS 为 Option，
+   其余平台为 Shift），等效于按住修饰键拖选，但无需真的按。 */
 let forceSelect = localStorage.getItem("sshpro.forcesel") !== "0";
-const FORCE_PROP = /Mac/.test(navigator.platform) ? "altKey" : "shiftKey";
-
-/* ---------- 最近连接记录（不含密码） ---------- */
-
-function loadRecents() {
-  try { return JSON.parse(localStorage.getItem("sshpro.recents")) || []; }
-  catch { return []; }
-}
-
-function saveRecent(host, port, username) {
-  const list = loadRecents().filter((r) => r.host !== host);
-  list.unshift({ host, port, username });
-  localStorage.setItem("sshpro.recents", JSON.stringify(list.slice(0, 10)));
-  renderRecents();
-}
-
-function renderRecents() {
-  $("#recent-hosts").innerHTML = loadRecents()
-    .map((r) => `<option value="${r.host}">${r.username}@${r.host}:${r.port}</option>`)
-    .join("");
-}
+const IS_MAC = ["Macintosh", "MacIntel", "MacPPC", "Mac68K"]
+  .includes(navigator.platform);
+const FORCE_PROP = IS_MAC ? "altKey" : "shiftKey";
 
 /* ---------- 会话 ---------- */
 
 let sessions = [];
 let active = null;
 
+function tabLabel(name) {
+  if (name === "sshpro") return "终端 1";
+  const m = name.match(/^sshpro-(\d+)$/);
+  return m ? `终端 ${m[1]}` : name;
+}
+
 class Session {
-  constructor(opts, ws) {
-    this.opts = opts;
+  constructor(name, ws) {
+    this.name = name;
     this.ws = ws;
     this.dead = false;
-    this.sysinfo = null;
-    this.stats = null;
+    this.destroying = false;
+    this.cwd = null;          // 终端当前目录（后端轮询推送）
+    this.fsPath = null;       // 文件面板当前目录
+    this.fsEntries = null;
+    this.fsError = null;
+    this.fsFollow = true;
 
     this.holder = document.createElement("div");
     this.holder.className = "term-holder hidden";
@@ -116,8 +108,7 @@ class Session {
       scrollback: 10000,
       allowProposedApi: true,
       altClickMovesCursor: false,
-      // macOS 上强制划选依赖 Option 修饰键，且必须显式打开这个开关，
-      // 否则注入的 altKey 不生效（Windows/Linux 走 shiftKey，无需开关）
+      // macOS 上强制划选走 Option 修饰键，且必须显式打开这个开关
       macOptionClickForcesSelection: true,
     });
     this.fit = new FitAddon.FitAddon();
@@ -131,13 +122,13 @@ class Session {
     });
 
     // 强制选择：捕获阶段给鼠标事件打上修饰键标记，xterm 便始终走本地划选
-    const forceShift = (e) => {
+    const forceMod = (e) => {
       if (forceSelect && !e[FORCE_PROP]) {
         Object.defineProperty(e, FORCE_PROP, { get: () => true });
       }
     };
     for (const type of ["mousedown", "mousemove", "mouseup", "dblclick"]) {
-      this.holder.addEventListener(type, forceShift, true);
+      this.holder.addEventListener(type, forceMod, true);
     }
 
     // 选中即复制（拖选结束后自动写入剪贴板）
@@ -147,17 +138,29 @@ class Session {
       this._selTimer = setTimeout(() => {
         const sel = this.term.getSelection();
         if (sel) copyText(sel);
-      }, 250);
+      }, 300);
     });
 
-    // 有选中内容时 Ctrl+C = 复制（不发 SIGINT），无选中时照常中断
+    // 有选中内容时 Cmd+C / Ctrl+C = 复制（走我们自己的可靠路径），
+    // 无选中时 Ctrl+C 照常发送中断
     this.term.attachCustomKeyEventHandler((e) => {
-      if (e.type === "keydown" && e.ctrlKey && !e.altKey &&
+      if (e.type === "keydown" && (e.ctrlKey || e.metaKey) && !e.altKey &&
           (e.key === "c" || e.key === "C") && this.term.hasSelection()) {
         copyText(this.term.getSelection());
         this.term.clearSelection();
         return false;
       }
+      return true;
+    });
+
+    // OSC 7：若 shell 配置了目录上报，实时同步（比后端轮询更快）
+    this.term.parser.registerOscHandler(7, (data) => {
+      try {
+        const u = new URL(data);
+        if (u.protocol === "file:") {
+          this.onCwd(decodeURIComponent(u.pathname) || "/");
+        }
+      } catch { /* 忽略无效 OSC */ }
       return true;
     });
 
@@ -167,10 +170,17 @@ class Session {
     this.tab = document.createElement("div");
     this.tab.className = "tab";
     this.tab.innerHTML =
-      `<span class="dot"></span><span class="label"></span><button class="close" title="关闭">×</button>`;
-    this.tab.querySelector(".label").textContent =
-      opts.local ? "本机" : `${opts.username}@${opts.host}`;
-    this.tab.addEventListener("click", () => this.activate());
+      `<span class="dot"></span><span class="label"></span><button class="close" title="关闭标签（会话保留，可随时恢复）">×</button>`;
+    this.tab.querySelector(".label").textContent = tabLabel(name);
+    this.tab.addEventListener("click", () => {
+      if (this.dead) {          // 点击已断开的标签 => 重连同名会话
+        const n = this.name;
+        this.dispose(true);
+        openSession(n);
+      } else {
+        this.activate();
+      }
+    });
     this.tab.querySelector(".close").addEventListener("click", (e) => {
       e.stopPropagation();
       this.dispose();
@@ -178,8 +188,8 @@ class Session {
     $("#tabs").appendChild(this.tab);
 
     ws.onmessage = (ev) => this.onMessage(ev);
-    ws.onclose = () => this.markDead();
-    ws.onerror = () => this.markDead();
+    ws.onclose = () => this.onClosed();
+    ws.onerror = () => this.onClosed();
   }
 
   onMessage(ev) {
@@ -189,18 +199,31 @@ class Session {
     }
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.type === "sysinfo") {
-      this.sysinfo = msg;
-      if (this.opts.local && msg.hostname) {
-        this.tab.querySelector(".label").textContent = "本机 · " + msg.hostname;
-      }
-      if (active === this) renderSysinfo(this);
-    } else if (msg.type === "stats") {
-      this.stats = msg;
-      if (active === this) renderStats(this);
+    if (msg.type === "cwd") {
+      this.onCwd(msg.path);
     } else if (msg.type === "closed") {
-      this.markDead();
+      this.onClosed();
     }
+  }
+
+  onCwd(path) {
+    this.cwd = path;
+    if (this.fsFollow && path && path !== this.fsPath) {
+      fpNavigate(this, path);
+    }
+  }
+
+  onClosed() {
+    if (this.destroying) {   // 手动销毁：直接移除标签
+      this.dispose(true);
+      toast(`${tabLabel(this.name)} 已销毁`);
+      return;
+    }
+    if (this.dead) return;
+    this.dead = true;
+    this.tab.classList.add("dead");
+    this.term.write(
+      "\r\n\x1b[1;33m⏸ 连接已断开\x1b[0m —— 会话仍在后台运行，点击此标签即可重连\r\n");
   }
 
   refit() {
@@ -215,26 +238,19 @@ class Session {
 
   activate() {
     active = this;
+    localStorage.setItem("sshpro.active", this.name);
     sessions.forEach((s) => {
       s.tab.classList.toggle("active", s === this);
       s.holder.classList.toggle("hidden", s !== this);
     });
+    $("#empty").hidden = true;
     this.refit();
     this.term.focus();
-    renderSysinfo(this);
-    renderStats(this);
+    renderFiles(this);
+    if (!this.fsEntries && !this.fsError) fpNavigate(this, this.cwd || "");
   }
 
-  markDead() {
-    if (this.dead) return;
-    this.dead = true;
-    this.tab.classList.add("dead");
-    this.term.write(this.opts.local
-      ? "\r\n\x1b[1;33m⏸ 连接已断开\x1b[0m —— 后台命令仍在 tmux 会话中运行，刷新页面即可接回\r\n"
-      : "\r\n\x1b[1;31m✖ 连接已断开\x1b[0m（关闭标签页后可重新连接）\r\n");
-  }
-
-  dispose() {
+  dispose(quiet) {
     this.dead = true;
     try { this.ws.close(); } catch { /* noop */ }
     this.resizeObs.disconnect();
@@ -246,90 +262,29 @@ class Session {
       active = null;
       if (sessions.length) {
         sessions[sessions.length - 1].activate();
-      } else {
-        clearMonitor();
-        showLogin(false);
+      } else if (!quiet) {
+        showEmpty();
       }
     }
+    if (!sessions.length && !quiet) showEmpty();
   }
 }
 
-/* ---------- 监控面板渲染 ---------- */
-
-function clearMonitor() {
-  renderSysinfo(null);
-  renderStats(null);
+function showEmpty() {
+  $("#empty").hidden = false;
+  clearFiles();
 }
 
-function renderSysinfo(s) {
-  const info = s && s.sysinfo;
-  $("#mon-hostname").textContent = info ? info.hostname : "—";
-  $("#mon-os").textContent = info ? info.os : "—";
-  $("#mon-kernel").textContent = info ? info.kernel : "—";
-  $("#mon-cores").textContent = info ? info.cores : "—";
-}
+/* ---------- 会话打开 / 新建 / 销毁 ---------- */
 
-function renderStats(s) {
-  const st = s && s.stats;
-  $("#mon-uptime").textContent = st && st.uptime != null ? fmtUptime(st.uptime) : "—";
-
-  const cpu = st && st.cpu != null ? st.cpu : null;
-  $("#mon-cpu-pct").textContent = cpu != null ? cpu.toFixed(1) + "%" : "—";
-  setBar($("#mon-cpu-bar"), cpu != null ? cpu : 0);
-  $("#mon-load").textContent = st && st.load ? st.load.join("  ") : "—";
-
-  if (st && st.mem && st.mem.total > 0) {
-    const pct = (100 * st.mem.used) / st.mem.total;
-    $("#mon-mem-pct").textContent = pct.toFixed(1) + "%";
-    setBar($("#mon-mem-bar"), pct);
-    $("#mon-mem-txt").innerHTML =
-      `<b>${fmtBytes(st.mem.used)}</b> / ${fmtBytes(st.mem.total)}`;
-  } else {
-    $("#mon-mem-pct").textContent = "—";
-    setBar($("#mon-mem-bar"), 0);
-    $("#mon-mem-txt").textContent = "—";
-  }
-
-  if (st && st.swap && st.swap.total > 0) {
-    const pct = (100 * st.swap.used) / st.swap.total;
-    $("#mon-swap-pct").textContent = pct.toFixed(1) + "%";
-    setBar($("#mon-swap-bar"), pct);
-  } else {
-    $("#mon-swap-pct").textContent = st ? "未启用" : "—";
-    setBar($("#mon-swap-bar"), 0);
-  }
-
-  const disksEl = $("#mon-disks");
-  if (st && st.disks && st.disks.length) {
-    disksEl.innerHTML = st.disks.map((d) => {
-      const pct = d.total > 0 ? (100 * d.used) / d.total : 0;
-      const cls = pct >= 90 ? "bad" : pct >= 70 ? "warn" : "";
-      return `<div class="disk-item">
-        <div class="disk-head">
-          <span class="mount" title="${d.mount}">${d.mount}</span>
-          <span class="size">${fmtBytes(d.used)} / ${fmtBytes(d.total)}</span>
-        </div>
-        <div class="bar slim"><i class="${cls}" style="width:${pct.toFixed(1)}%"></i></div>
-      </div>`;
-    }).join("");
-  } else {
-    disksEl.innerHTML = '<div class="mon-sub">—</div>';
-  }
-
-  $("#mon-rx").textContent = st && st.net ? fmtRate(st.net.rx) : "—";
-  $("#mon-tx").textContent = st && st.net ? fmtRate(st.net.tx) : "—";
-}
-
-/* ---------- 登录 / 连接流程 ---------- */
-
-function connectLocal() {
+function openSession(name, onFail) {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.binaryType = "arraybuffer";
   let settled = false;
 
   ws.onopen = () => {
-    ws.send(JSON.stringify({ type: "auth", local: true, cols: 80, rows: 24 }));
+    ws.send(JSON.stringify({ type: "auth", session: name, cols: 80, rows: 24 }));
   };
   ws.onmessage = (ev) => {
     if (settled || ev.data instanceof ArrayBuffer) return;
@@ -337,141 +292,265 @@ function connectLocal() {
     try { msg = JSON.parse(ev.data); } catch { return; }
     if (msg.type === "ready") {
       settled = true;
-      hideLogin();
-      const session = new Session({ local: true }, ws);
-      sessions.push(session);
-      session.activate();
+      if (msg.tmux === false) {
+        toast("服务器未安装 tmux，此会话断线后无法恢复", true);
+      }
+      const s = new Session(name, ws);
+      sessions.push(s);
+      const wanted = localStorage.getItem("sshpro.active");
+      if (!active || name === wanted) s.activate();
     } else if (msg.type === "error") {
       settled = true;
-      showLogin(sessions.length > 0);
-      loginError(msg.message || "本机会话不可用");
+      toast(msg.message || "会话打开失败", true);
+      if (onFail) onFail();
     }
   };
   const fail = (text) => () => {
-    if (!settled) { settled = true; showLogin(sessions.length > 0); loginError(text); }
+    if (!settled) {
+      settled = true;
+      toast(text, true);
+      if (onFail) onFail();
+    }
   };
   ws.onerror = fail("无法连接 sshpro 服务");
   ws.onclose = fail("连接被服务端关闭");
 }
 
-function showLogin(cancellable) {
-  $("#login-overlay").classList.remove("hidden");
-  $("#btn-cancel").hidden = !cancellable;
-  $("#login-error").hidden = true;
-  const recents = loadRecents();
-  if (recents.length && !$("#f-host").value) {
-    $("#f-host").value = recents[0].host;
-    $("#f-port").value = recents[0].port;
-    $("#f-user").value = recents[0].username;
+async function newSession() {
+  const taken = new Set(sessions.map((s) => s.name));
+  try {
+    const r = await fetch("/api/sessions");
+    (await r.json()).sessions.forEach((n) => taken.add(n));
+  } catch { /* 服务器列表拿不到就只按本地开着的算 */ }
+  let name = "sshpro";
+  for (let i = 2; taken.has(name); i++) name = `sshpro-${i}`;
+  openSession(name);
+}
+
+function destroyActive() {
+  if (!active) return;
+  const s = active;
+  const label = tabLabel(s.name);
+  if (!confirm(`彻底销毁 ${label}？其中正在运行的程序都会被终止，且无法恢复。`)) return;
+  s.destroying = true;
+  fetch(`/api/kill?name=${encodeURIComponent(s.name)}`, { method: "POST" })
+    .then((r) => r.json())
+    .then((d) => {
+      if (!d.ok) { s.destroying = false; toast("销毁失败", true); }
+      // 成功时 tmux 会话被杀，PTY 退出 -> onClosed 走 destroying 分支移除标签
+    })
+    .catch(() => { s.destroying = false; toast("销毁请求失败", true); });
+}
+
+/* ---------- 文件面板 ---------- */
+
+const VIEWABLE = /(\.txt|\.log(\.\d+)?|\.out)$/i;
+
+function fpParent(p) {
+  const q = (p || "/").replace(/\/+$/, "");
+  const i = q.lastIndexOf("/");
+  return i <= 0 ? "/" : q.slice(0, i);
+}
+
+function fpJoin(dir, name) {
+  return (dir.endsWith("/") ? dir : dir + "/") + name;
+}
+
+async function fpNavigate(s, path, manual) {
+  if (manual) s.fsFollow = false;
+  try {
+    const r = await fetch(`/api/fs/list?path=${encodeURIComponent(path || "")}`);
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    s.fsPath = data.path;
+    s.fsEntries = data.entries;
+    s.fsError = null;
+  } catch (e) {
+    s.fsError = e.message;
   }
-  $("#f-pass").value = "";
-  ($("#f-host").value ? $("#f-pass") : $("#f-host")).focus();
+  if (active === s) renderFiles(s);
 }
 
-function hideLogin() {
-  $("#login-overlay").classList.add("hidden");
-  $("#app").hidden = false;
+function clearFiles() {
+  $("#fp-path").textContent = "—";
+  $("#fp-path").title = "";
+  $("#fp-list").innerHTML = "";
+  $("#fp-follow").classList.remove("on");
 }
 
-function loginError(text) {
-  const el = $("#login-error");
-  el.textContent = text;
-  el.hidden = false;
-  $("#btn-connect").disabled = false;
-  $("#btn-connect").textContent = "连 接";
-}
-
-function connect(opts) {
-  $("#btn-connect").disabled = true;
-  $("#btn-connect").textContent = "连接中…";
-
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.binaryType = "arraybuffer";
-  let settled = false;
-
-  ws.onopen = () => {
-    ws.send(JSON.stringify({
-      type: "auth",
-      host: opts.host, port: opts.port,
-      username: opts.username, password: opts.password,
-      cols: 80, rows: 24,
-    }));
-  };
-
-  ws.onmessage = (ev) => {
-    if (settled || ev.data instanceof ArrayBuffer) return;
-    let msg;
-    try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.type === "ready") {
-      settled = true;
-      saveRecent(opts.host, opts.port, opts.username);
-      hideLogin();
-      $("#btn-connect").disabled = false;
-      $("#btn-connect").textContent = "连 接";
-      const session = new Session(opts, ws);
-      sessions.push(session);
-      session.activate();
-    } else if (msg.type === "error") {
-      settled = true;
-      loginError(msg.message || "连接失败");
+function renderFiles(s) {
+  if (!s) { clearFiles(); return; }
+  $("#fp-path").textContent = s.fsPath || "—";
+  $("#fp-path").title = s.fsPath || "";
+  $("#fp-follow").classList.toggle("on", s.fsFollow);
+  const list = $("#fp-list");
+  list.innerHTML = "";
+  if (s.fsError) {
+    const err = document.createElement("div");
+    err.className = "fp-error";
+    err.textContent = s.fsError;
+    list.appendChild(err);
+    return;
+  }
+  if (!s.fsEntries) return;
+  if (!s.fsEntries.length) {
+    const empty = document.createElement("div");
+    empty.className = "fp-error";
+    empty.textContent = "（空目录）";
+    list.appendChild(empty);
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const ent of s.fsEntries) {
+    const full = fpJoin(s.fsPath, ent.name);
+    const row = document.createElement("div");
+    row.className = "fp-item" + (ent.dir ? " dir" : "");
+    const ico = document.createElement("span");
+    ico.className = "fp-ico";
+    ico.textContent = ent.dir ? "📁" : "📄";
+    const name = document.createElement("span");
+    name.className = "fp-name";
+    name.textContent = ent.name;
+    name.title = ent.name;
+    const size = document.createElement("span");
+    size.className = "fp-size";
+    size.textContent = ent.dir ? "" : fmtBytes(ent.size);
+    row.append(ico, name, size);
+    if (ent.dir) {
+      row.addEventListener("click", () => fpNavigate(s, full, true));
+    } else {
+      const act = document.createElement("span");
+      act.className = "fp-act";
+      if (VIEWABLE.test(ent.name)) {
+        const v = document.createElement("button");
+        v.className = "fp-btn";
+        v.textContent = "查看";
+        v.title = "在线查看";
+        v.addEventListener("click", (e) => { e.stopPropagation(); openViewer(full); });
+        act.appendChild(v);
+      }
+      const d = document.createElement("button");
+      d.className = "fp-btn";
+      d.textContent = "⬇";
+      d.title = "下载";
+      d.addEventListener("click", (e) => { e.stopPropagation(); download(full); });
+      act.appendChild(d);
+      row.appendChild(act);
+      if (VIEWABLE.test(ent.name)) {
+        row.classList.add("viewable");
+        row.addEventListener("click", () => openViewer(full));
+      }
     }
-  };
+    frag.appendChild(row);
+  }
+  list.appendChild(frag);
+}
 
-  ws.onerror = () => { if (!settled) { settled = true; loginError("无法连接 sshpro 服务"); } };
-  ws.onclose = () => { if (!settled) { settled = true; loginError("连接被服务端关闭"); } };
+function download(path) {
+  const a = document.createElement("a");
+  a.href = `/api/fs/download?path=${encodeURIComponent(path)}`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+async function openViewer(path) {
+  $("#viewer").classList.remove("hidden");
+  $("#viewer-title").textContent = path;
+  $("#viewer-title").title = path;
+  $("#viewer-note").hidden = true;
+  const body = $("#viewer-body");
+  body.textContent = "加载中…";
+  $("#viewer-dl").onclick = () => download(path);
+  try {
+    const r = await fetch(`/api/fs/view?path=${encodeURIComponent(path)}`);
+    if (!r.ok) {
+      const data = await r.json().catch(() => ({}));
+      throw new Error(data.error || `HTTP ${r.status}`);
+    }
+    const skipped = Number(r.headers.get("X-Sshpro-Skipped") || 0);
+    body.textContent = await r.text();
+    if (skipped > 0) {
+      const note = $("#viewer-note");
+      note.textContent = `文件较大，已跳过开头 ${fmtBytes(skipped)}，仅显示末尾部分`;
+      note.hidden = false;
+      body.scrollTop = body.scrollHeight;   // 日志默认看最新
+    } else {
+      body.scrollTop = 0;
+    }
+  } catch (e) {
+    body.textContent = "加载失败：" + e.message;
+  }
+}
+
+function closeViewer() {
+  $("#viewer").classList.add("hidden");
+  if (active) active.term.focus();
 }
 
 /* ---------- 事件绑定 ---------- */
 
-$("#login-form").addEventListener("submit", (e) => {
-  e.preventDefault();
-  connect({
-    host: $("#f-host").value.trim(),
-    port: parseInt($("#f-port").value, 10) || 22,
-    username: $("#f-user").value.trim(),
-    password: $("#f-pass").value,
-  });
-});
-
-$("#f-host").addEventListener("input", () => {
-  const r = loadRecents().find((x) => x.host === $("#f-host").value.trim());
-  if (r) { $("#f-port").value = r.port; $("#f-user").value = r.username; }
-});
-
-$("#btn-new").addEventListener("click", () => showLogin(true));
-$("#btn-cancel").addEventListener("click", () => {
-  $("#login-overlay").classList.add("hidden");
-  if (active) active.term.focus();
-});
-$("#btn-local").addEventListener("click", () => connectLocal());
+$("#btn-new").addEventListener("click", newSession);
+$("#btn-empty-new").addEventListener("click", newSession);
+$("#btn-destroy").addEventListener("click", destroyActive);
 
 $("#btn-copy").addEventListener("click", () => {
   forceSelect = !forceSelect;
   localStorage.setItem("sshpro.forcesel", forceSelect ? "1" : "0");
   $("#btn-copy").classList.toggle("on", forceSelect);
+  toast(forceSelect ? "强制选中复制：开" : "强制选中复制：关（鼠标交还远端程序）");
   if (active) active.term.focus();
 });
 if (forceSelect) $("#btn-copy").classList.add("on");
 
-$("#btn-monitor").addEventListener("click", () => {
-  const hidden = $("#monitor").classList.toggle("hidden");
-  $("#btn-monitor").classList.toggle("on", !hidden);
-  localStorage.setItem("sshpro.monitor", hidden ? "0" : "1");
+$("#btn-files").addEventListener("click", () => {
+  const hidden = $("#files").classList.toggle("hidden");
+  $("#btn-files").classList.toggle("on", !hidden);
+  localStorage.setItem("sshpro.files", hidden ? "0" : "1");
   if (active) active.refit();
 });
-
-if (localStorage.getItem("sshpro.monitor") === "0") {
-  $("#monitor").classList.add("hidden");
+if (localStorage.getItem("sshpro.files") === "0") {
+  $("#files").classList.add("hidden");
 } else {
-  $("#btn-monitor").classList.add("on");
+  $("#btn-files").classList.add("on");
 }
 
-window.addEventListener("beforeunload", (e) => {
-  // 本机会话跑在 tmux 里，关页面不丢任务，无需拦截
-  if (sessions.some((s) => !s.dead && !s.opts.local)) e.preventDefault();
+$("#fp-up").addEventListener("click", () => {
+  if (active && active.fsPath) fpNavigate(active, fpParent(active.fsPath), true);
+});
+$("#fp-refresh").addEventListener("click", () => {
+  if (active) fpNavigate(active, active.fsPath || "");
+});
+$("#fp-follow").addEventListener("click", () => {
+  if (!active) return;
+  active.fsFollow = !active.fsFollow;
+  if (active.fsFollow && active.cwd) fpNavigate(active, active.cwd);
+  else renderFiles(active);
 });
 
-renderRecents();
-clearMonitor();
-connectLocal();
+$("#viewer-close").addEventListener("click", closeViewer);
+$("#viewer").addEventListener("click", (e) => {
+  if (e.target === $("#viewer")) closeViewer();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("#viewer").classList.contains("hidden")) closeViewer();
+});
+
+/* ---------- 启动：恢复所有 tmux 会话 ---------- */
+
+async function init() {
+  clearFiles();
+  let names = [];
+  try {
+    const r = await fetch("/api/sessions");
+    const data = await r.json();
+    names = data.sessions || [];
+    if (!data.tmux) toast("服务器未安装 tmux，会话断线后无法恢复", true);
+  } catch {
+    toast("无法获取会话列表", true);
+  }
+  if (!names.length) names = ["sshpro"];
+  names.forEach((n) => openSession(n));
+}
+
+init();
