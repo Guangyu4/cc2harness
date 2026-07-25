@@ -132,6 +132,39 @@ class E2ETest(tornado.testing.AsyncHTTPTestCase):
                                   method="POST", body=b"", raise_error=False)
         assert resp.code == 400
 
+    @tornado.testing.gen_test(timeout=40)
+    async def test_status_and_osc52(self):
+        """状态上报（目录 + 鼠标标志）与 OSC52 剪贴板通路。"""
+        ws = await self._session("sshpro-5")
+        for _ in range(80):
+            msg = await ws.read_message()
+            if not isinstance(msg, bytes):
+                d = json.loads(msg)
+                if d["type"] == "status":
+                    assert d["cwd"].startswith("/"), d
+                    assert isinstance(d["mouse"], bool), d
+                    break
+        else:
+            raise AssertionError("no status message")
+
+        code, out = sshpro_app.tmux_run("show-options", "-s", "set-clipboard")
+        assert code == 0 and "on" in out, out
+
+        # 会话内程序发出的 OSC52 应能穿透 tmux 到达浏览器端
+        ws.write_message(json.dumps({"type": "data", "data":
+            "printf '\\033]52;c;%s\\007' \"$(printf hello | base64)\"\n"}))
+        buf = b""
+        for _ in range(200):
+            msg = await ws.read_message()
+            if msg is None:
+                break
+            if isinstance(msg, bytes):
+                buf += msg
+                if b"]52;" in buf and b"aGVsbG8=" in buf:
+                    break
+        assert b"]52;" in buf, buf[-400:]
+        ws.close()
+
     @tornado.testing.gen_test(timeout=30)
     async def test_fs_api(self):
         tmpd = tempfile.mkdtemp(prefix="sshpro-fs-")

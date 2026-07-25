@@ -91,6 +91,7 @@ class Session {
     this.dead = false;
     this.destroying = false;
     this.cwd = null;          // 终端当前目录（后端轮询推送）
+    this.paneMouse = null;    // 前台程序是否接管鼠标（null=未知，按接管处理）
     this.fsPath = null;       // 文件面板当前目录
     this.fsEntries = null;
     this.fsError = null;
@@ -122,9 +123,11 @@ class Session {
       }
     });
 
-    // 强制选择：捕获阶段给鼠标事件打上修饰键标记，xterm 便始终走本地划选
+    // 强制选择（智能分流）：仅当前台程序接管了鼠标（vim/htop/claude 等）
+    // 才注入修饰键走 xterm 本地划选；普通 shell 下把拖选交给 tmux copy-mode，
+    // 这样可以边选边滚、跨多屏选择，松手后 tmux 经 OSC52 写回剪贴板
     const forceMod = (e) => {
-      if (forceSelect && !e[FORCE_PROP]) {
+      if (forceSelect && this.paneMouse !== false && !e[FORCE_PROP]) {
         Object.defineProperty(e, FORCE_PROP, { get: () => true });
       }
     };
@@ -150,6 +153,20 @@ class Session {
         copyText(this.term.getSelection());
         this.term.clearSelection();
         return false;
+      }
+      return true;
+    });
+
+    // OSC 52：tmux copy-mode 选中（及远端程序请求）的文本写入本地剪贴板
+    this.term.parser.registerOscHandler(52, (data) => {
+      const i = data.indexOf(";");
+      const b64 = i >= 0 ? data.slice(i + 1) : data;
+      if (b64 && b64 !== "?") {
+        try {
+          const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+          const text = new TextDecoder().decode(bytes);
+          if (text) copyText(text);
+        } catch { /* 无效 base64，忽略 */ }
       }
       return true;
     });
@@ -200,8 +217,9 @@ class Session {
     }
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.type === "cwd") {
-      this.onCwd(msg.path);
+    if (msg.type === "status") {
+      this.paneMouse = typeof msg.mouse === "boolean" ? msg.mouse : null;
+      this.onCwd(msg.cwd);
     } else if (msg.type === "closed") {
       this.onClosed();
     }

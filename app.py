@@ -50,7 +50,7 @@ import tornado.websocket
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
-CWD_INTERVAL = 2.0             # 终端目录轮询间隔（秒）
+CWD_INTERVAL = 1.5             # 终端状态（目录/鼠标模式）轮询间隔（秒）
 VIEW_LIMIT = 2 * 1024 * 1024   # 在线查看最多返回字节数（大日志取末尾）
 
 SESSION_PREFIX = "sshpro"
@@ -192,10 +192,17 @@ class TermHandler(tornado.websocket.WebSocketHandler):
     def _spawn(self, name, cols, rows):
         if TMUX:
             # 附加后开启鼠标模式：滚轮直接滚动 tmux 历史（触控板平滑），
-            # 否则滚轮会被转成方向键连发；顺带调大历史行数
-            cmd = tmux_cmd("new-session", "-A", "-s", name,
-                           ";", "set-option", "-g", "mouse", "on",
-                           ";", "set-option", "-g", "history-limit", "50000")
+            # 否则滚轮会被转成方向键连发；调大历史行数；
+            # set-clipboard + clipboard 终端能力：copy-mode 选中后
+            # tmux 通过 OSC 52 把文本回传给浏览器写入剪贴板
+            cmd = tmux_cmd(
+                "new-session", "-A", "-s", name,
+                ";", "set-option", "-g", "mouse", "on",
+                ";", "set-option", "-g", "history-limit", "50000",
+                ";", "set-option", "-s", "set-clipboard", "on",
+                ";", "set-option", "-sa", "terminal-features",
+                "xterm-256color:clipboard",
+            )
         else:  # 无 tmux 的退化模式：普通 shell，无法断线恢复
             cmd = [os.environ.get("SHELL", "/bin/bash"), "-l"]
         try:
@@ -245,26 +252,33 @@ class TermHandler(tornado.websocket.WebSocketHandler):
         self.loop.add_callback(self._shell_closed)
 
     def _cwd_loop(self):
-        """轮询终端当前目录，变化时推送给前端文件面板。"""
+        """轮询终端状态（当前目录 + 前台程序是否接管鼠标），变化时推送前端。
+        前端据 mouse 标志决定划选交给 tmux copy-mode 还是 xterm 本地选择。"""
         last = None
         while not self.stop_evt.wait(CWD_INTERVAL if last else 0.3):
-            path = self._current_cwd()
-            if path and path != last:
-                last = path
-                self.loop.add_callback(self._send_json,
-                                       {"type": "cwd", "path": path})
+            cur = self._pane_status()
+            if cur[0] and cur != last:
+                last = cur
+                self.loop.add_callback(
+                    self._send_json,
+                    {"type": "status", "cwd": cur[0], "mouse": cur[1]})
 
-    def _current_cwd(self):
+    def _pane_status(self):
+        """返回 (当前目录, 前台程序是否接管鼠标)；非 tmux 模式鼠标状态未知为 None。"""
         if TMUX and self.name:
-            code, out = tmux_run("display-message", "-p", "-t", "=" + self.name,
-                                 "#{pane_current_path}", timeout=3)
-            p = out.strip()
-            if code == 0 and p.startswith("/"):
-                return p
+            # 注意不能用 "=name" 精确匹配前缀：tmux 3.2a 的 display-message
+            # 会静默返回空串；裸名称本身就是精确匹配优先
+            code, out = tmux_run("display-message", "-p", "-t", self.name,
+                                 "#{pane_current_path}\n#{mouse_any_flag}",
+                                 timeout=3)
+            lines = out.splitlines()
+            if code == 0 and lines and lines[0].startswith("/"):
+                mouse = len(lines) > 1 and lines[1].strip() == "1"
+                return lines[0], mouse
         try:
-            return os.readlink("/proc/%d/cwd" % self.pty_pid)
+            return os.readlink("/proc/%d/cwd" % self.pty_pid), None
         except OSError:
-            return None
+            return None, None
 
     # ---- 以下方法只在 IOLoop 线程调用 ----
 
