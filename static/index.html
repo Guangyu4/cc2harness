@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sshpro · Web SSH 终端</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="vendor/xterm.css">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div id="app" hidden>
+  <header id="topbar">
+    <div class="logo">ssh<span>pro</span></div>
+    <nav id="tabs"></nav>
+    <button id="btn-new" class="icon-btn" title="新建连接">＋</button>
+    <div class="spacer"></div>
+    <button id="btn-monitor" class="icon-btn" title="显示 / 隐藏监控面板">▥</button>
+  </header>
+
+  <div id="main">
+    <div id="terms"></div>
+
+    <aside id="monitor">
+      <section class="mon-card" id="mon-host">
+        <h3 id="mon-hostname">—</h3>
+        <div class="mon-kv"><span>系统</span><b id="mon-os">—</b></div>
+        <div class="mon-kv"><span>内核</span><b id="mon-kernel">—</b></div>
+        <div class="mon-kv"><span>CPU 核数</span><b id="mon-cores">—</b></div>
+        <div class="mon-kv"><span>已运行</span><b id="mon-uptime">—</b></div>
+      </section>
+
+      <section class="mon-card">
+        <div class="mon-title">CPU <em id="mon-cpu-pct">—</em></div>
+        <div class="bar"><i id="mon-cpu-bar"></i></div>
+        <div class="mon-sub">负载 <b id="mon-load">—</b></div>
+      </section>
+
+      <section class="mon-card">
+        <div class="mon-title">内存 <em id="mon-mem-pct">—</em></div>
+        <div class="bar"><i id="mon-mem-bar"></i></div>
+        <div class="mon-sub" id="mon-mem-txt">—</div>
+        <div class="mon-title swap-title">Swap <em id="mon-swap-pct">—</em></div>
+        <div class="bar slim"><i id="mon-swap-bar"></i></div>
+      </section>
+
+      <section class="mon-card">
+        <div class="mon-title">磁盘</div>
+        <div id="mon-disks"></div>
+      </section>
+
+      <section class="mon-card">
+        <div class="mon-title">网络</div>
+        <div class="net-row">
+          <div class="net-cell"><span class="net-dir dl">↓ 下行</span><b id="mon-rx">—</b></div>
+          <div class="net-cell"><span class="net-dir ul">↑ 上行</span><b id="mon-tx">—</b></div>
+        </div>
+      </section>
+    </aside>
+  </div>
+</div>
+
+<div id="login-overlay">
+  <form id="login-form" autocomplete="on">
+    <div class="login-logo">ssh<span>pro</span></div>
+    <p class="login-tip">网页版 SSH 终端 · 输入服务器信息即可连接</p>
+    <div class="field-row">
+      <label class="field grow">
+        <span>主机地址</span>
+        <input id="f-host" list="recent-hosts" required placeholder="192.168.1.10" autocapitalize="off" spellcheck="false">
+        <datalist id="recent-hosts"></datalist>
+      </label>
+      <label class="field port">
+        <span>端口</span>
+        <input id="f-port" type="number" min="1" max="65535" value="22" required>
+      </label>
+    </div>
+    <label class="field">
+      <span>用户名</span>
+      <input id="f-user" required placeholder="root" autocapitalize="off" spellcheck="false">
+    </label>
+    <label class="field">
+      <span>密码</span>
+      <input id="f-pass" type="password" required placeholder="••••••••">
+    </label>
+    <div id="login-error" hidden></div>
+    <button id="btn-connect" type="submit">连 接</button>
+    <button id="btn-cancel" type="button" hidden>返 回</button>
+  </form>
+</div>
+
+<script src="vendor/xterm.js"></script>
+<script src="vendor/addon-fit.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
