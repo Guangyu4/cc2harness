@@ -116,6 +116,9 @@ class Session {
       scrollback: 10000,
       allowProposedApi: true,
       altClickMovesCursor: false,
+      // macOS 上强制划选依赖 Option 修饰键，且必须显式打开这个开关，
+      // 否则注入的 altKey 不生效（Windows/Linux 走 shiftKey，无需开关）
+      macOptionClickForcesSelection: true,
     });
     this.fit = new FitAddon.FitAddon();
     this.term.loadAddon(this.fit);
