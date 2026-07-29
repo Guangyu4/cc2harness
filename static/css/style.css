@@ -300,6 +300,76 @@ body {
   color: var(--text);
 }
 
+/* ---------- 浮动输入框 ---------- */
+#composer {
+  position: fixed;
+  top: 56px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 780px;
+  height: 360px;
+  min-width: 380px;
+  min-height: 180px;
+  max-width: 96vw;
+  max-height: 92vh;
+  resize: both;              /* 右下角拉伸，宽高都可调 */
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  z-index: 15;
+}
+#composer.hidden { display: none; }
+
+#composer-head {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  cursor: move;
+  user-select: none;
+  touch-action: none;
+}
+
+#composer-text {
+  flex: 1;
+  min-height: 0;
+  border: none;
+  outline: none;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, "Cascadia Code", Consolas, "Noto Sans Mono CJK SC", monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  padding: 10px 12px;
+  resize: none;
+}
+#composer-text::placeholder { color: var(--dim); opacity: 0.75; }
+
+#composer-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+}
+#composer-send {
+  border: none;
+  border-radius: 7px;
+  padding: 6px 18px;
+  font-size: 13px;
+  font-weight: 700;
+  font-family: inherit;
+  cursor: pointer;
+  background: linear-gradient(90deg, var(--accent), var(--accent2));
+  color: #06101c;
+}
+#composer-send:hover { filter: brightness(1.12); }
+
 /* ---------- Toast ---------- */
 #toast {
   position: fixed;

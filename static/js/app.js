@@ -291,7 +291,7 @@ class Session {
     });
     $("#empty").hidden = true;
     this.refit();
-    this.term.focus();
+    if (document.activeElement !== $("#composer-text")) this.term.focus();
     renderFiles(this);
     if (!this.fsEntries && !this.fsError) fpNavigate(this, this.cwd || "");
   }
@@ -521,6 +521,47 @@ function closeViewer() {
   if (active) active.term.focus();
 }
 
+/* ---------- 浮动输入框：多行编辑后一键发送 ----------
+   解决在终端里给 Claude Code 等程序输入时，回车直接提交、无法从容
+   写多行的问题：在这里回车只换行，点「发送」才整段进入终端。 */
+
+function toggleComposer(show) {
+  const box = $("#composer");
+  const want = show === undefined ? box.classList.contains("hidden") : show;
+  box.classList.toggle("hidden", !want);
+  $("#btn-compose").classList.toggle("on", want);
+  localStorage.setItem("sshpro.compose", want ? "1" : "0");
+  if (want) {
+    $("#composer-text").focus();
+  } else if (active) {
+    active.term.focus();
+  }
+}
+
+function composerSend() {
+  const ta = $("#composer-text");
+  const text = ta.value;
+  if (!text.trim()) return;
+  if (!active || active.dead || active.ws.readyState !== WebSocket.OPEN) {
+    toast("没有已连接的终端", true);
+    return;
+  }
+  const s = active;
+  // 经 term.paste() 发送：目标程序若开了括号粘贴（Claude Code 等 TUI），
+  // 多行会整块插入而不被逐行执行；随后单独补一个回车完成提交——
+  // 回车必须与粘贴分开发，紧贴着发会被并入粘贴块导致不提交
+  s.term.paste(text);
+  setTimeout(() => {
+    if (!s.dead && s.ws.readyState === WebSocket.OPEN) {
+      s.ws.send(JSON.stringify({ type: "data", data: "\r" }));
+    }
+  }, 60);
+  ta.value = "";
+  localStorage.removeItem("sshpro.draft");
+  ta.focus();
+  toast(`已发送到 ${sessLabel(s)}`);
+}
+
 /* ---------- 事件绑定 ---------- */
 
 $("#btn-new").addEventListener("click", newSession);
@@ -561,6 +602,78 @@ $("#fp-follow").addEventListener("click", () => {
   else renderFiles(active);
 });
 
+$("#btn-compose").addEventListener("click", () => toggleComposer());
+$("#composer-close").addEventListener("click", () => toggleComposer(false));
+$("#composer-send").addEventListener("click", composerSend);
+
+$("#composer-text").addEventListener("input", () => {
+  localStorage.setItem("sshpro.draft", $("#composer-text").value);
+});
+// 输入法组合中的回车属于输入法自己（选词、或把拼音原文直接上屏），不是发送。
+// 只看 e.isComposing 不够：不少浏览器（Safari、Linux 下的 fcitx/ibus 等）会先
+// 发 compositionend 再发这个 keydown，轮到我们时 isComposing 已经变回 false，
+// 于是这一下回车被误当成发送。所以自己记住组合状态，并在组合刚结束的极短
+// 时间内继续把回车让给输入法；真想发送时再按一次即可。
+let imeOn = false;
+let imeEndAt = -Infinity;
+$("#composer-text").addEventListener("compositionstart", () => { imeOn = true; });
+$("#composer-text").addEventListener("compositionend", () => {
+  imeOn = false;
+  imeEndAt = performance.now();
+});
+const enterBelongsToIME = (e) =>
+  imeOn || e.isComposing || e.keyCode === 229 || performance.now() - imeEndAt < 100;
+
+$("#composer-text").addEventListener("keydown", (e) => {
+  // 回车 = 发送，Shift+回车 = 换行
+  if (e.key === "Enter" && !e.shiftKey && !enterBelongsToIME(e)) {
+    e.preventDefault();
+    composerSend();
+  } else if (e.key === "Escape") {
+    e.stopPropagation();
+    toggleComposer(false);
+  }
+});
+
+// 尺寸记忆：恢复上次手动调整的大小，之后每次变化都记下来
+try {
+  const { w, h } = JSON.parse(localStorage.getItem("sshpro.composersize"));
+  if (w) $("#composer").style.width = w + "px";
+  if (h) $("#composer").style.height = h + "px";
+} catch { /* 没存过或数据无效，用默认尺寸 */ }
+new ResizeObserver(() => {
+  const box = $("#composer");
+  if (box.classList.contains("hidden")) return;   // display:none 时上报 0×0，不能存
+  const r = box.getBoundingClientRect();
+  if (r.width && r.height) {
+    localStorage.setItem("sshpro.composersize",
+      JSON.stringify({ w: Math.round(r.width), h: Math.round(r.height) }));
+  }
+}).observe($("#composer"));
+
+// 拖动标题栏移动输入框
+$("#composer-head").addEventListener("pointerdown", (e) => {
+  if (e.target.closest("button")) return;
+  e.preventDefault();
+  const box = $("#composer");
+  const rect = box.getBoundingClientRect();
+  const dx = e.clientX - rect.left;
+  const dy = e.clientY - rect.top;
+  const move = (ev) => {
+    const x = Math.max(4, Math.min(ev.clientX - dx, innerWidth - rect.width - 4));
+    const y = Math.max(4, Math.min(ev.clientY - dy, innerHeight - 48));
+    box.style.left = x + "px";
+    box.style.top = y + "px";
+    box.style.transform = "none";
+  };
+  const up = () => {
+    removeEventListener("pointermove", move);
+    removeEventListener("pointerup", up);
+  };
+  addEventListener("pointermove", move);
+  addEventListener("pointerup", up);
+});
+
 $("#viewer-close").addEventListener("click", closeViewer);
 $("#viewer").addEventListener("click", (e) => {
   if (e.target === $("#viewer")) closeViewer();
@@ -573,6 +686,8 @@ document.addEventListener("keydown", (e) => {
 
 async function init() {
   clearFiles();
+  $("#composer-text").value = localStorage.getItem("sshpro.draft") || "";
+  if (localStorage.getItem("sshpro.compose") === "1") toggleComposer(true);
   let list = [];
   try {
     const r = await fetch("/api/sessions");
