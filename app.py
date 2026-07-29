@@ -319,6 +319,17 @@ class TermHandler(tornado.websocket.WebSocketHandler):
             self.pty_fd = None
 
 
+class StaticHandler(tornado.web.StaticFileHandler):
+    """带 ?v= 的资源沿用 Tornado 的十年强缓存（换版本号即换 URL，安全）；
+    但 index.html 没有版本号可换，Tornado 又不给它发 Cache-Control，
+    浏览器就按启发式规则自行缓存 HTML，改了 ?v= 也送不到客户端。
+    所以给它 no-cache：每次回源校验，没变照样走 304，几乎不费流量。"""
+
+    def set_extra_headers(self, path):
+        if "v" not in self.request.arguments:
+            self.set_header("Cache-Control", "no-cache")
+
+
 class SessionsHandler(tornado.web.RequestHandler):
     def get(self):
         self.write({"tmux": bool(TMUX), "sessions": list_tmux_sessions()})
@@ -409,7 +420,7 @@ def make_app():
         (r"/api/kill", KillHandler),
         (r"/api/rename", RenameHandler),
         (r"/api/fs/(list|view|download)", FsHandler),
-        (r"/(.*)", tornado.web.StaticFileHandler,
+        (r"/(.*)", StaticHandler,
          {"path": STATIC_DIR, "default_filename": "index.html"}),
     ])
 
