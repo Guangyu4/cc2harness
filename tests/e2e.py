@@ -228,6 +228,41 @@ class E2ETest(tornado.testing.AsyncHTTPTestCase):
         assert resp.code == 415
         assert "二进制" in json.loads(resp.body)["error"]
 
+    @tornado.testing.gen_test(timeout=30)
+    async def test_upload(self):
+        """粘贴图片上传：落盘、按类型定后缀、拒绝非图片。"""
+        tmpd = tempfile.mkdtemp(prefix="sshpro-up-")
+        old = sshpro_app.UPLOAD_DIR
+        sshpro_app.UPLOAD_DIR = tmpd
+        try:
+            client = tornado.httpclient.AsyncHTTPClient()
+            png = b"\x89PNG\r\n\x1a\n" + bytes(64)
+            resp = await client.fetch(
+                self.get_url("/api/upload"), method="POST", body=png,
+                headers={"Content-Type": "image/png"})
+            path = json.loads(resp.body)["path"]
+            assert path.startswith(tmpd) and path.endswith(".png"), path
+            with open(path, "rb") as f:
+                assert f.read() == png
+
+            # jpeg 走 .jpg 后缀；带 charset 参数也能识别
+            resp = await client.fetch(
+                self.get_url("/api/upload"), method="POST", body=b"\xff\xd8x",
+                headers={"Content-Type": "image/jpeg; charset=binary"})
+            assert json.loads(resp.body)["path"].endswith(".jpg")
+
+            # 非图片 / 空文件被拒绝
+            resp = await client.fetch(
+                self.get_url("/api/upload"), method="POST", body=b"hello",
+                headers={"Content-Type": "text/plain"}, raise_error=False)
+            assert resp.code == 415
+            resp = await client.fetch(
+                self.get_url("/api/upload"), method="POST", body=b"",
+                headers={"Content-Type": "image/png"}, raise_error=False)
+            assert resp.code == 400
+        finally:
+            sshpro_app.UPLOAD_DIR = old
+
 
 if __name__ == "__main__":
     import unittest

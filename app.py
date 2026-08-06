@@ -22,6 +22,7 @@ WebSocket 协议（一个连接对应一个会话标签）：
 HTTP 接口：
     GET  /api/sessions                        # 列出可恢复的 tmux 会话
     POST /api/kill?name=sshpro-2              # 彻底销毁一个会话
+    POST /api/upload                          # 粘贴图片上传，返回落盘路径
     GET  /api/fs/list?path=/a                 # 文件面板：目录列表
     GET  /api/fs/view?path=/a/b.log           # 在线查看（大文件取末尾）
     GET  /api/fs/download?path=/a/b           # 下载
@@ -40,6 +41,7 @@ import struct
 import subprocess
 import threading
 import termios
+import time
 import urllib.parse
 import uuid
 
@@ -52,6 +54,13 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 CWD_INTERVAL = 1.5             # 终端状态（目录/鼠标模式）轮询间隔（秒）
 VIEW_LIMIT = 2 * 1024 * 1024   # 在线查看最多返回字节数（大日志取末尾）
+
+UPLOAD_DIR = os.path.expanduser("~/.sshpro/uploads")
+UPLOAD_LIMIT = 20 * 1024 * 1024
+UPLOAD_KEEP_DAYS = 7           # 上传的图片过期自动清理
+IMG_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif",
+           "image/webp": "webp", "image/bmp": "bmp", "image/svg+xml": "svg",
+           "image/tiff": "tiff", "image/avif": "avif"}
 
 SESSION_PREFIX = "sshpro"
 NAME_RE = re.compile(r"^sshpro[A-Za-z0-9_-]{0,32}$")
@@ -365,6 +374,51 @@ class RenameHandler(tornado.web.RequestHandler):
         self.write({"ok": code == 0})
 
 
+def prune_uploads():
+    cutoff = time.time() - UPLOAD_KEEP_DAYS * 86400
+    try:
+        with os.scandir(UPLOAD_DIR) as it:
+            for e in it:
+                try:
+                    if e.is_file() and e.stat().st_mtime < cutoff:
+                        os.unlink(e.path)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+
+
+class UploadHandler(tornado.web.RequestHandler):
+    """浏览器里粘贴的图片落盘成文件，路径回给前端插进输入框——
+    终端里的程序（Claude Code 等）没法收二进制，但认识路径。"""
+
+    def post(self):
+        ctype = (self.request.headers.get("Content-Type") or "") \
+            .partition(";")[0].strip().lower()
+        ext = IMG_EXT.get(ctype)
+        if not ext:
+            self.set_status(415)
+            self.write({"error": "只支持图片（收到 %s）" % (ctype or "未知类型")})
+            return
+        body = self.request.body
+        if not body:
+            self.set_status(400)
+            self.write({"error": "空文件"})
+            return
+        if len(body) > UPLOAD_LIMIT:
+            self.set_status(413)
+            self.write({"error": "图片超过 20MB"})
+            return
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        name = "img-%s-%s.%s" % (time.strftime("%Y%m%d-%H%M%S"),
+                                 uuid.uuid4().hex[:4], ext)
+        path = os.path.join(UPLOAD_DIR, name)
+        with open(path, "wb") as f:
+            f.write(body)
+        prune_uploads()
+        self.write({"path": path})
+
+
 class FsHandler(tornado.web.RequestHandler):
     async def get(self, action):
         path = self.get_argument("path", "")
@@ -419,6 +473,7 @@ def make_app():
         (r"/api/sessions", SessionsHandler),
         (r"/api/kill", KillHandler),
         (r"/api/rename", RenameHandler),
+        (r"/api/upload", UploadHandler),
         (r"/api/fs/(list|view|download)", FsHandler),
         (r"/(.*)", StaticHandler,
          {"path": STATIC_DIR, "default_filename": "index.html"}),

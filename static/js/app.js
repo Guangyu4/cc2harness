@@ -542,6 +542,10 @@ function composerSend() {
   const ta = $("#composer-text");
   const text = ta.value;
   if (!text.trim()) return;
+  if (UPLOAD_MARK_RE.test(text)) {
+    toast("图片还在上传，稍等片刻再发送", true);
+    return;
+  }
   if (!active || active.dead || active.ws.readyState !== WebSocket.OPEN) {
     toast("没有已连接的终端", true);
     return;
@@ -561,6 +565,46 @@ function composerSend() {
   ta.focus();
   toast(`已发送到 ${sessLabel(s)}`);
 }
+
+/* 粘贴图片：终端程序收不了二进制，于是把图片上传落盘，把文件路径插进
+   光标处占位符的位置——Claude Code 等程序拿到路径就能自己读图。
+   上传期间占位符留在文本里；若用户把占位符删了，视为取消，路径不再插入。 */
+const UPLOAD_MARK_RE = /⟪图片上传中#\d+⟫/;
+let uploadSeq = 0;
+
+async function composerUpload(file) {
+  const ta = $("#composer-text");
+  const mark = `⟪图片上传中#${++uploadSeq}⟫`;
+  ta.setRangeText(mark, ta.selectionStart, ta.selectionEnd, "end");
+  const finish = (text) => {
+    const i = ta.value.indexOf(mark);
+    if (i < 0) return;
+    ta.setRangeText(text, i, i + mark.length, "preserve");
+    localStorage.setItem("sshpro.draft", ta.value);
+  };
+  try {
+    const r = await fetch("/api/upload", { method: "POST", body: file });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    finish(data.path + " ");
+  } catch (e) {
+    finish("");
+    toast("图片上传失败：" + e.message, true);
+  }
+}
+
+$("#composer-text").addEventListener("paste", (e) => {
+  const files = [];
+  for (const it of (e.clipboardData && e.clipboardData.items) || []) {
+    if (it.kind === "file" && it.type.startsWith("image/")) {
+      const f = it.getAsFile();
+      if (f) files.push(f);
+    }
+  }
+  if (!files.length) return;   // 纯文本粘贴走浏览器默认行为
+  e.preventDefault();
+  files.forEach(composerUpload);
+});
 
 /* ---------- 事件绑定 ---------- */
 
